@@ -22,6 +22,7 @@ Set a writable matplotlib cache directory:
 
 ```bash
 export MPLCONFIGDIR=/tmp/ultrasound_decoding_mpl_cache
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 mkdir -p "$MPLCONFIGDIR"
 ```
 
