@@ -16,6 +16,9 @@ METHOD_ORDER = [
     "cnn2d_lstm",
     "cnn2d_temporal1d",
     "single_frame_late_fusion",
+    "fcnn_late_fusion",
+    "fcnn_meanpool",
+    "fcnn_lstm",
 ]
 METHOD_COLORS = {
     "pca_lda_flat4": "#4C78A8",
@@ -24,6 +27,9 @@ METHOD_COLORS = {
     "cnn2d_lstm": "#E45756",
     "cnn2d_temporal1d": "#72B7B2",
     "single_frame_late_fusion": "#B279A2",
+    "fcnn_late_fusion": "#9D755D",
+    "fcnn_meanpool": "#59A14F",
+    "fcnn_lstm": "#EDC948",
 }
 
 
@@ -69,18 +75,19 @@ def plot_method_comparison(master: pd.DataFrame, task: str, out_dir: Path, stem:
         return []
     sessions = sorted(summary["session"].astype(str).unique().tolist(), key=lambda value: int(value))
     x = np.arange(len(sessions), dtype=float)
-    width = 0.12
+    methods = [method for method in METHOD_ORDER if method in set(summary["method"])]
+    width = min(0.12, 0.78 / max(len(methods), 1))
     fig, ax = plt.subplots(figsize=(10, 4.8))
-    for method_i, method in enumerate(METHOD_ORDER):
+    for method_i, method in enumerate(methods):
         subset = summary[summary["method"] == method].set_index("session")
         means = [float(subset.loc[session, "balanced_accuracy_mean"]) if session in subset.index else np.nan for session in sessions]
         stds = [float(subset.loc[session, "balanced_accuracy_std"]) if session in subset.index else 0.0 for session in sessions]
-        offset = (method_i - (len(METHOD_ORDER) - 1) / 2.0) * width
+        offset = (method_i - (len(methods) - 1) / 2.0) * width
         ax.bar(
             x + offset,
             means,
             width=width,
-            color=METHOD_COLORS[method],
+            color=METHOD_COLORS.get(method, "#777777"),
             label=MODEL_DISPLAY_NAMES[method],
             edgecolor="white",
             linewidth=0.4,
@@ -161,7 +168,7 @@ def plot_order_sensitivity(order_df: pd.DataFrame, task: str, out_dir: Path, ste
         .reset_index()
     )
     sessions = sorted(grouped["session"].astype(str).unique().tolist(), key=lambda value: int(value))
-    methods = [method for method in ["cnn2d_lstm", "cnn2d_temporal1d"] if method in set(grouped["method"])]
+    methods = [method for method in ["cnn2d_lstm", "cnn2d_temporal1d", "fcnn_lstm"] if method in set(grouped["method"])]
     if not methods:
         return []
     fig, axes = plt.subplots(1, len(methods), figsize=(5.2 * len(methods), 4.2), sharey=True)
@@ -255,12 +262,119 @@ def plot_confusion_matrices(
     return paths
 
 
+def plot_block_type_accuracy(block_type_df: pd.DataFrame, task: str, out_dir: Path, stem: str) -> list[Path]:
+    plt = _setup_matplotlib()
+    df = block_type_df[block_type_df["task"] == task].copy() if not block_type_df.empty else pd.DataFrame()
+    if df.empty:
+        return []
+    sessions = sorted(df["session"].astype(str).unique().tolist(), key=lambda value: int(value))
+    methods = [method for method in METHOD_ORDER if method in set(df["method"])]
+    block_cols = [
+        ("grating_accuracy", "grating"),
+        ("dot_accuracy", "dot"),
+        ("stop_after_grating_accuracy", "stop"),
+        ("static_accuracy", "static"),
+    ]
+    fig, axes = plt.subplots(len(methods), 1, figsize=(8.8, max(2.2, 1.25 * len(methods))), sharex=True)
+    axes = np.asarray(axes).reshape(len(methods))
+    x = np.arange(len(sessions), dtype=float)
+    width = 0.18
+    colors = ["#4C78A8", "#54A24B", "#F58518", "#B279A2"]
+    for ax, method in zip(axes, methods):
+        subset = df[df["method"] == method].set_index("session")
+        for i, ((col, label), color) in enumerate(zip(block_cols, colors)):
+            values = [float(subset.loc[session, col]) if session in subset.index else np.nan for session in sessions]
+            ax.bar(x + (i - 1.5) * width, values, width=width, color=color, label=label, edgecolor="white", linewidth=0.4)
+        ax.axhline(CHANCE_LEVEL, color="#333333", linestyle="--", linewidth=0.8)
+        ax.set_ylim(0.0, 1.02)
+        ax.set_ylabel(MODEL_DISPLAY_NAMES.get(method, method), rotation=0, ha="right", va="center")
+        ax.grid(axis="y", color="#DDDDDD", linewidth=0.6)
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(sessions)
+    axes[-1].set_xlabel("Session")
+    axes[0].legend(frameon=False, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.35))
+    fig.suptitle(f"Block-type accuracy: {task}", y=1.01)
+    fig.tight_layout()
+    paths = save_png_pdf(fig, out_dir, stem)
+    plt.close(fig)
+    return paths
+
+
+def plot_generalization_gap(overfitting_summary: pd.DataFrame, task: str, out_dir: Path, stem: str) -> list[Path]:
+    plt = _setup_matplotlib()
+    df = overfitting_summary[overfitting_summary["task"] == task].copy() if not overfitting_summary.empty else pd.DataFrame()
+    if df.empty:
+        return []
+    methods = [method for method in METHOD_ORDER if method in set(df["method"])]
+    sessions = sorted(df["session"].astype(str).unique().tolist(), key=lambda value: int(value))
+    x = np.arange(len(methods), dtype=float)
+    width = min(0.11, 0.8 / max(len(sessions), 1))
+    fig, ax = plt.subplots(figsize=(10, 4.6))
+    for i, session in enumerate(sessions):
+        subset = df[df["session"].astype(str) == session].set_index("method")
+        values = [float(subset.loc[method, "mean_generalization_gap"]) if method in subset.index else np.nan for method in methods]
+        ax.bar(x + (i - (len(sessions) - 1) / 2.0) * width, values, width=width, label=session, linewidth=0.3)
+    ax.axhline(0.0, color="#333333", linewidth=1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_DISPLAY_NAMES.get(method, method) for method in methods], rotation=25, ha="right")
+    ax.set_ylabel("Final train accuracy minus test BA")
+    ax.set_title(f"Train-test diagnostic gap: {task}")
+    ax.grid(axis="y", color="#DDDDDD", linewidth=0.6)
+    ax.legend(title="Session", frameon=False, ncol=min(len(sessions), 7))
+    fig.tight_layout()
+    paths = save_png_pdf(fig, out_dir, stem)
+    plt.close(fig)
+    return paths
+
+
+def plot_parameter_count_vs_test_ba(master: pd.DataFrame, task: str, out_dir: Path, stem: str) -> list[Path]:
+    plt = _setup_matplotlib()
+    df = master[master["task"] == task].copy() if not master.empty else pd.DataFrame()
+    if df.empty or "model_parameters" not in df:
+        return []
+    summary = seed_mean_summary(df)
+    if summary.empty:
+        return []
+    params = (
+        df.groupby(["session", "task", "method"], sort=True)["model_parameters"]
+        .first()
+        .reset_index()
+    )
+    summary["session"] = summary["session"].astype(str)
+    params["session"] = params["session"].astype(str)
+    summary = summary.merge(params, on=["session", "task", "method"], how="left")
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    for method in [method for method in METHOD_ORDER if method in set(summary["method"])]:
+        subset = summary[summary["method"] == method]
+        ax.scatter(
+            subset["model_parameters"].astype(float),
+            subset["balanced_accuracy_mean"].astype(float),
+            s=34,
+            color=METHOD_COLORS.get(method, "#777777"),
+            label=MODEL_DISPLAY_NAMES.get(method, method),
+            alpha=0.9,
+        )
+    ax.axhline(CHANCE_LEVEL, color="#333333", linestyle="--", linewidth=1.0)
+    ax.set_xscale("symlog", linthresh=1)
+    ax.set_xlabel("Trainable parameters")
+    ax.set_ylabel("Balanced Accuracy")
+    ax.set_ylim(0.0, 1.02)
+    ax.grid(color="#DDDDDD", linewidth=0.6)
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=3)
+    fig.tight_layout()
+    paths = save_png_pdf(fig, out_dir, stem)
+    plt.close(fig)
+    return paths
+
+
 def make_all_plots(
     master: pd.DataFrame,
     order_df: pd.DataFrame,
     confusion_df: pd.DataFrame,
     task: str,
     out_dir: Path,
+    overfitting_summary: pd.DataFrame | None = None,
+    block_type_df: pd.DataFrame | None = None,
 ) -> list[Path]:
     paths: list[Path] = []
     comparison_stem = (
@@ -272,4 +386,9 @@ def make_all_plots(
     paths.extend(plot_temporal_gain(master, task, out_dir, "temporal_model_gain"))
     paths.extend(plot_order_sensitivity(order_df, task, out_dir, "order_sensitivity"))
     paths.extend(plot_confusion_matrices(confusion_df, task, out_dir, "multiframe_confusion_matrices"))
+    if overfitting_summary is not None:
+        paths.extend(plot_generalization_gap(overfitting_summary, task, out_dir, "generalization_gap"))
+    if block_type_df is not None:
+        paths.extend(plot_block_type_accuracy(block_type_df, task, out_dir, "block_type_accuracy"))
+    paths.extend(plot_parameter_count_vs_test_ba(master, task, out_dir, "parameter_count_vs_test_ba"))
     return paths

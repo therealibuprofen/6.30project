@@ -219,6 +219,12 @@ pca_lda
 
 多帧样本在进入 PCA + LDA 前按时间顺序展平拼接。交叉验证分组仍为 `cycle`；708 有 6 个完整 cycle 时使用 6 折，其他 session 使用现有 `grouped_cv_splits(..., max_folds=10)` 逻辑，最多 10 折。标准化、PCA 和 LDA 都只在训练 fold 上 fit，测试 fold 只使用训练 fold 得到的 transform 和模型。
 
+### Block级多帧基准
+
+block级多帧入口是 `scripts/multiframe/run_multiframe_benchmark.py`，使用 `processed_data/block_sequences_v1/` 中的 `[N_blocks, 4, 128, 501]` clean4 序列，并始终按 `cycle` 分组交叉验证。当前多帧 binary 基准包含 PCA/LDA、SmallCNN 系列，以及复用正式单帧 FCNN 的 `fcnn_late_fusion`、`fcnn_meanpool`、`fcnn_lstm`。FCNN frame encoder 固定为 `MaxPool2d(2,2) -> Flatten -> Linear(64*250,3) -> ReLU`，没有使用 `fcnn_paper_32`。
+
+多帧 runbook 见 `scripts/multiframe/RUNBOOK.md`。其中记录了 FCNN smoke/正式服务器命令、legacy CNN 与 FCNN 结果合并命令、checkpoint manifest、逐 block 顺序敏感性预测输出、采样时间审计，以及训练轮数/帧数敏感性实验的独立目录。旧 `results/runs/multiframe/block_clean4_binary_v1/` 结果不包含 checkpoint 或逐 block 顺序敏感性预测，因此不会从旧 fold 级 summary 反推这些缺失产物。
+
 时间字段是 nominal 映射，不是事件日志的精确时间戳。原因是当前原始数据没有单独事件表；代码按 `.mat` 文件序号和约 4 s 采集组推断标签，并把文件中心时间用于 clean-middle。对 `stimulus_type`，grating/dot 的同一 position 具有相同名义中心，位置 0/1/2/3 约为 10/14/18/22 s，aggregate 中 `time_mapping_status = nominal`。对 `binary`，no-stimulus block 与 stimulus block 的 4 s 采集组相位不同：同一 position 在 grating/dot 与 stop/static 之间约有 2 s 差异，因此 aggregate 中 `time_mapping_status = block_dependent_nominal`，不再把不同 block 的时间简单平均成唯一时间；主汇总保留 `position` 和 block-specific 时间列表，完整映射写入 `aggregate/fixed_window_block_time_mapping.csv`。
 
 统一输出位置：

@@ -167,6 +167,204 @@ def vs_singleframe_reference(master: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def overfitting_audit_tables(
+    fold_summary: pd.DataFrame,
+    training_history: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    audit_columns = [
+        "session",
+        "task",
+        "method",
+        "seed",
+        "fold",
+        "final_train_accuracy",
+        "final_train_loss",
+        "test_balanced_accuracy",
+        "test_accuracy",
+        "generalization_gap",
+        "n_train_blocks",
+        "n_test_blocks",
+        "final_epoch",
+    ]
+    summary_columns = [
+        "session",
+        "task",
+        "method",
+        "method_display",
+        "mean_train_accuracy",
+        "mean_test_ba",
+        "mean_generalization_gap",
+        "std_generalization_gap",
+        "fraction_train_accuracy_above_0_95",
+        "fraction_test_ba_below_0_5",
+    ]
+    if fold_summary.empty or training_history.empty:
+        return pd.DataFrame(columns=audit_columns), pd.DataFrame(columns=summary_columns)
+
+    history = training_history.copy()
+    fold_df = fold_summary.copy()
+    key_cols = ["session", "task", "method", "seed", "fold"]
+    for col in ["seed", "fold"]:
+        history[col] = pd.to_numeric(history[col], errors="coerce").astype("Int64")
+        fold_df[col] = pd.to_numeric(fold_df[col], errors="coerce").astype("Int64")
+    history["epoch"] = pd.to_numeric(history["epoch"], errors="coerce")
+    history = history.dropna(subset=["epoch"]).sort_values(key_cols + ["epoch"])
+    final_history = history.groupby(key_cols, sort=True, dropna=False).tail(1).copy()
+    merged = final_history.merge(
+        fold_df[
+            key_cols
+            + [
+                "n_train_blocks",
+                "n_test_blocks",
+                "accuracy",
+                "balanced_accuracy",
+            ]
+        ],
+        on=key_cols,
+        how="inner",
+    )
+    if merged.empty:
+        return pd.DataFrame(columns=audit_columns), pd.DataFrame(columns=summary_columns)
+
+    audit = pd.DataFrame(
+        {
+            "session": merged["session"].astype(str),
+            "task": merged["task"],
+            "method": merged["method"],
+            "seed": merged["seed"].astype(int),
+            "fold": merged["fold"].astype(int),
+            "final_train_accuracy": pd.to_numeric(merged["train_accuracy"], errors="coerce"),
+            "final_train_loss": pd.to_numeric(merged["train_loss"], errors="coerce"),
+            "test_balanced_accuracy": pd.to_numeric(merged["balanced_accuracy"], errors="coerce"),
+            "test_accuracy": pd.to_numeric(merged["accuracy"], errors="coerce"),
+            "n_train_blocks": pd.to_numeric(merged["n_train_blocks"], errors="coerce").astype(int),
+            "n_test_blocks": pd.to_numeric(merged["n_test_blocks"], errors="coerce").astype(int),
+            "final_epoch": pd.to_numeric(merged["epoch"], errors="coerce").astype(int),
+        }
+    )
+    audit["generalization_gap"] = audit["final_train_accuracy"] - audit["test_balanced_accuracy"]
+    audit = audit[audit_columns]
+
+    rows: list[dict[str, Any]] = []
+    for (session, task, method), group in audit.groupby(["session", "task", "method"], sort=True):
+        gaps = group["generalization_gap"].astype(float)
+        rows.append(
+            {
+                "session": str(session),
+                "task": task,
+                "method": method,
+                "method_display": MODEL_DISPLAY_NAMES.get(method, method),
+                "mean_train_accuracy": float(group["final_train_accuracy"].astype(float).mean()),
+                "mean_test_ba": float(group["test_balanced_accuracy"].astype(float).mean()),
+                "mean_generalization_gap": float(gaps.mean()),
+                "std_generalization_gap": float(gaps.std(ddof=1)) if len(gaps) > 1 else 0.0,
+                "fraction_train_accuracy_above_0_95": float((group["final_train_accuracy"].astype(float) > 0.95).mean()),
+                "fraction_test_ba_below_0_5": float((group["test_balanced_accuracy"].astype(float) < 0.5).mean()),
+            }
+        )
+    return audit, pd.DataFrame(rows, columns=summary_columns)
+
+
+def order_sensitivity_oof_summary(order_predictions: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "session",
+        "task",
+        "method",
+        "seed",
+        "order_condition",
+        "balanced_accuracy",
+        "accuracy",
+        "macro_f1",
+        "prediction_is_single_class",
+        "n_blocks",
+        "original_minus_reverse",
+        "original_minus_fixed_shuffle",
+    ]
+    if order_predictions.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    for keys, group in order_predictions.groupby(["session", "task", "method", "seed", "order_condition"], sort=True):
+        session, task, method, seed, order_condition = keys
+        y_true = group["truth"].to_numpy(dtype=np.int64)
+        y_pred = group["prediction"].to_numpy(dtype=np.int64)
+        metrics = metrics_with_flags(y_true, y_pred)
+        rows.append(
+            {
+                "session": str(session),
+                "task": task,
+                "method": method,
+                "seed": int(seed),
+                "order_condition": order_condition,
+                "balanced_accuracy": float(metrics["balanced_accuracy"]),
+                "accuracy": float(metrics["accuracy"]),
+                "macro_f1": float(metrics["macro_f1"]),
+                "prediction_is_single_class": bool(metrics["prediction_is_single_class"]),
+                "n_blocks": int(len(group)),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=columns)
+    deltas = []
+    for keys, group in out.groupby(["session", "task", "method", "seed"], sort=True):
+        by_condition = group.set_index("order_condition")["balanced_accuracy"].to_dict()
+        deltas.append(
+            {
+                "session": keys[0],
+                "task": keys[1],
+                "method": keys[2],
+                "seed": int(keys[3]),
+                "original_minus_reverse": (
+                    float(by_condition["original"] - by_condition["reverse"])
+                    if {"original", "reverse"}.issubset(by_condition)
+                    else np.nan
+                ),
+                "original_minus_fixed_shuffle": (
+                    float(by_condition["original"] - by_condition["fixed_shuffle"])
+                    if {"original", "fixed_shuffle"}.issubset(by_condition)
+                    else np.nan
+                ),
+            }
+        )
+    out = out.merge(pd.DataFrame(deltas), on=["session", "task", "method", "seed"], how="left")
+    return out[columns]
+
+
+def block_type_accuracy(predictions: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "session",
+        "task",
+        "method",
+        "method_display",
+        "dot_accuracy",
+        "grating_accuracy",
+        "static_accuracy",
+        "stop_after_grating_accuracy",
+        "n_predictions",
+    ]
+    if predictions.empty or "block_name" not in predictions:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, Any]] = []
+    for (session, task, method), group in predictions.groupby(["session", "task", "method"], sort=True):
+        row: dict[str, Any] = {
+            "session": str(session),
+            "task": task,
+            "method": method,
+            "method_display": MODEL_DISPLAY_NAMES.get(method, method),
+            "n_predictions": int(len(group)),
+        }
+        for block_name in ["dot", "grating", "static", "stop_after_grating"]:
+            subset = group[group["block_name"].astype(str) == block_name]
+            row[f"{block_name}_accuracy"] = (
+                float((subset["truth"].astype(int) == subset["pred"].astype(int)).mean())
+                if not subset.empty
+                else np.nan
+            )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
 def completeness_report(
     *,
     task: str,

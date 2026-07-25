@@ -3,11 +3,13 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 import numpy as np
 import pandas as pd
 import torch
+from torch import nn
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -24,6 +26,7 @@ SPEC.loader.exec_module(multiframe_script)
 
 from ultrasound_decoding.cv import grouped_cv_splits
 from ultrasound_decoding.linear import ClassContrastivePCATransformer
+from ultrasound_decoding.deep import FCNN
 from ultrasound_decoding.multiframe.dataset import (
     EXPECTED_BLOCK_SHAPE,
     TASK_CLASS_NAMES,
@@ -35,15 +38,27 @@ from ultrasound_decoding.multiframe.models import (
     CNN2DLSTM,
     CNN2DMeanPool,
     CNN2DTemporal1D,
+    FCNNFrameEncoder,
+    FCNNLSTM,
+    FCNNMeanPool,
+    METHOD_USES_TEMPORAL_ORDER,
     MODEL_DESCRIPTIONS,
     SmallCNNFrameEncoder,
     build_multiframe_model,
     count_trainable_parameters,
     encoder_architecture_signature,
+    fcnn_frame_encoder_architecture_signature,
 )
 from ultrasound_decoding.multiframe.training import (
+    DeepTrainingConfig,
+    blocks_to_frame_tensor,
+    blocks_to_sequence_tensor,
+    load_multiframe_checkpoint,
     normalize_blocks_train_fold_only,
     order_sensitivity_for_trained_sequence_model,
+    predict_probabilities,
+    save_fold_checkpoint,
+    train_sequence_fold,
 )
 
 
@@ -159,6 +174,71 @@ class MultiframeBenchmarkTests(unittest.TestCase):
             logits = model(torch.zeros(2, 1, 128, 501))
         self.assertEqual(tuple(logits.shape), (2, 2))
 
+    def test_fcnn_frame_encoder_matches_official_fcnn_bottleneck(self) -> None:
+        official = FCNN(input_shape=(128, 501), n_classes=2)
+        encoder = FCNNFrameEncoder(input_shape=(128, 501))
+        self.assertEqual(fcnn_frame_encoder_architecture_signature(), (
+            ("MaxPool2d", (2, 2)),
+            ("Flatten", None),
+            ("Linear", (64 * 250, 3)),
+            ("ReLU", None),
+        ))
+        self.assertEqual([type(layer) for layer in encoder.layers], [type(layer) for layer in official[:4]])
+        self.assertEqual(encoder.layers[2].out_features, 3)
+        with torch.no_grad():
+            z = encoder(torch.zeros(2, 1, 128, 501))
+        self.assertEqual(tuple(z.shape), (2, 3))
+
+    def test_fcnn_meanpool_uses_time_dim_one_and_shared_encoder(self) -> None:
+        model = FCNNMeanPool(n_classes=3)
+        self.assertIsInstance(model.encoder, FCNNFrameEncoder)
+        self.assertEqual(len([module for module in model.modules() if isinstance(module, FCNNFrameEncoder)]), 1)
+
+        class DummyEncoder(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x[:, 0, 0, :3]
+
+        model.encoder = DummyEncoder()
+        model.classifier = nn.Identity()
+        x = torch.zeros(2, 4, 1, 128, 501)
+        values = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        x[:, :, 0, 0, :3] = values
+        with torch.no_grad():
+            pooled = model(x)
+        np.testing.assert_allclose(pooled.numpy(), values.mean(dim=1).numpy())
+
+    def test_fcnn_lstm_uses_three_dimensional_input_and_hidden_size_eight(self) -> None:
+        model = FCNNLSTM(n_classes=2)
+        captured: dict[str, tuple[int, ...]] = {}
+
+        def hook(_module, inputs):
+            captured["shape"] = tuple(inputs[0].shape)
+
+        handle = model.lstm.register_forward_pre_hook(hook)
+        try:
+            with torch.no_grad():
+                logits = model(torch.zeros(2, 4, 1, 128, 501))
+        finally:
+            handle.remove()
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertEqual(captured["shape"], (2, 4, 3))
+        self.assertEqual(model.lstm.input_size, 3)
+        self.assertEqual(model.lstm.hidden_size, 8)
+
+    def test_fcnn_late_fusion_reshape_and_label_repeat_order_are_consistent(self) -> None:
+        X = np.zeros((2, 4, 2, 3), dtype=np.float32)
+        for block_i in range(2):
+            for frame_i in range(4):
+                X[block_i, frame_i, 0, 0] = block_i * 10 + frame_i
+        frames = blocks_to_frame_tensor(X)
+        np.testing.assert_allclose(frames[:, 0, 0, 0].numpy(), np.asarray([0, 1, 2, 3, 10, 11, 12, 13]))
+        labels = np.asarray([5, 9])
+        np.testing.assert_array_equal(np.repeat(labels, 4), np.asarray([5, 5, 5, 5, 9, 9, 9, 9]))
+        frame_probs = np.arange(2 * 4 * 2, dtype=np.float32).reshape(8, 2)
+        block_probs = frame_probs.reshape(2, 4, 2).mean(axis=1)
+        np.testing.assert_allclose(block_probs[0], frame_probs[:4].mean(axis=0))
+        np.testing.assert_allclose(block_probs[1], frame_probs[4:].mean(axis=0))
+
     def test_order_sensitivity_keeps_labels_and_reports_required_columns(self) -> None:
         model = CNN2DLSTM(2)
         X = np.zeros((2, 4, 128, 501), dtype=np.float32)
@@ -176,9 +256,46 @@ class MultiframeBenchmarkTests(unittest.TestCase):
             self.assertIn(column, result)
             self.assertTrue(np.isfinite(result[column]))
 
+    def test_order_sensitivity_prediction_rows_keep_block_identity(self) -> None:
+        model = CNN2DLSTM(2)
+        X = np.zeros((2, 4, 128, 501), dtype=np.float32)
+        y = np.asarray([0, 1], dtype=np.int64)
+        result = order_sensitivity_for_trained_sequence_model(
+            model,
+            X,
+            y,
+            np.asarray([0, 1], dtype=np.int64),
+            device="cpu",
+            batch_size=2,
+            session="708",
+            task="binary",
+            method="cnn2d_lstm",
+            seed=0,
+            fold=1,
+            test_idx=np.asarray([0, 1]),
+            metadata=self.binary.metadata,
+            class_names=self.binary.class_names,
+            include_prediction_rows=True,
+        )
+        rows = pd.DataFrame(result["prediction_rows"])
+        self.assertEqual(set(rows["order_condition"]), {"original", "reverse", "fixed_shuffle"})
+        self.assertTrue(rows.groupby(["block_id", "order_condition"]).size().eq(1).all())
+        self.assertEqual(rows.groupby("block_id")["truth"].nunique().max(), 1)
+        self.assertIn("prob_no_stimulus", rows.columns)
+        self.assertIn("prob_stimulus", rows.columns)
+
     def test_results_and_protocol_constants_are_explicit(self) -> None:
         self.assertEqual(CHANCE_LEVEL, 0.5)
         self.assertEqual(multiframe_script.DEFAULT_SEEDS, [0, 1, 2])
+        self.assertTrue(METHOD_USES_TEMPORAL_ORDER["cnn2d_lstm"])
+        self.assertTrue(METHOD_USES_TEMPORAL_ORDER["cnn2d_temporal1d"])
+        self.assertTrue(METHOD_USES_TEMPORAL_ORDER["fcnn_lstm"])
+        self.assertFalse(METHOD_USES_TEMPORAL_ORDER["fcnn_meanpool"])
+        parameter_rows = pd.DataFrame(multiframe_script.parameter_audit_rows(["cnn2d_lstm", "fcnn_lstm", "fcnn_meanpool"]))
+        self.assertTrue(parameter_rows.set_index("method").loc["cnn2d_lstm", "uses_temporal_order"])
+        self.assertTrue(parameter_rows.set_index("method").loc["fcnn_lstm", "temporal_adaptation"])
+        self.assertFalse(parameter_rows.set_index("method").loc["fcnn_meanpool", "uses_temporal_order"])
+        self.assertFalse(parameter_rows["uses_fcnn_paper_32"].astype(bool).any())
         self.assertEqual(task_run_dir_name("binary"), "block_clean4_binary_v1")
         self.assertEqual(task_run_dir_name("stimulus_type"), "block_clean4_stimulus_type_v1")
         self.assertIn("adapted", MODEL_DESCRIPTIONS["cnn2d_temporal1d"])
@@ -216,6 +333,55 @@ class MultiframeBenchmarkTests(unittest.TestCase):
             ),
         )
         self.assertTrue(rows[0]["all_test_blocks_predicted_once"])
+
+    def test_checkpoint_reload_preserves_fcnn_predictions_and_pixel_stats(self) -> None:
+        rng = np.random.default_rng(0)
+        X_train = rng.normal(size=(4, 4, 128, 501)).astype(np.float32)
+        X_test = rng.normal(size=(2, 4, 128, 501)).astype(np.float32)
+        y_train = np.asarray([0, 1, 0, 1], dtype=np.int64)
+        classes = np.asarray([0, 1], dtype=np.int64)
+        result = train_sequence_fold(
+            "fcnn_meanpool",
+            X_train,
+            y_train,
+            X_test,
+            classes,
+            session="synthetic",
+            task="binary",
+            fold=1,
+            seed=0,
+            train_cycles="0,1",
+            test_cycles="2",
+            config=DeepTrainingConfig(max_epochs=1, batch_size=2),
+            device="cpu",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoint.pt"
+            manifest = save_fold_checkpoint(
+                checkpoint_path,
+                result,
+                classes=classes,
+                session="synthetic",
+                task="binary",
+                seed=0,
+                fold=1,
+                train_cycles="0,1",
+                test_cycles="2",
+                config=DeepTrainingConfig(max_epochs=1, batch_size=2),
+                code_version="test",
+            )
+            reloaded, payload = load_multiframe_checkpoint(checkpoint_path)
+            probs = predict_probabilities(
+                reloaded,
+                blocks_to_sequence_tensor(result.X_test_normalized),
+                device="cpu",
+                batch_size=2,
+            )
+        np.testing.assert_allclose(probs, result.probabilities, atol=1e-7)
+        self.assertEqual(payload["normalization_mean"].shape, (1, 128, 501))
+        self.assertEqual(payload["normalization_std"].shape, (1, 128, 501))
+        self.assertGreater(payload["normalization_mean"].size, 1)
+        self.assertEqual(manifest["status"], "available")
 
 
 if __name__ == "__main__":

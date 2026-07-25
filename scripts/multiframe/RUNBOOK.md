@@ -102,7 +102,8 @@ Strong-session binary benchmark.
   --batch-size 16 \
   --learning-rate 1e-3 \
   --weight-decay 1e-3 \
-  --device auto
+  --device auto \
+  --reuse-compatible-results
 ```
 
 ## Stage 3
@@ -120,7 +121,8 @@ All-session binary benchmark. If Stage 2 completed in the default output directo
   --batch-size 16 \
   --learning-rate 1e-3 \
   --weight-decay 1e-3 \
-  --device auto
+  --device auto \
+  --reuse-compatible-results
 ```
 
 ## Stage 4
@@ -138,7 +140,8 @@ All-session stimulus_type benchmark.
   --batch-size 16 \
   --learning-rate 1e-3 \
   --weight-decay 1e-3 \
-  --device auto
+  --device auto \
+  --reuse-compatible-results
 ```
 
 ## Rebuild Aggregate Outputs
@@ -153,6 +156,110 @@ All-session stimulus_type benchmark.
   --stage aggregate-only \
   --tasks stimulus_type \
   --sessions 708 709 710 807 813 817 822
+```
+
+`aggregate-only` does not train models. It rebuilds aggregate CSVs/plots plus the audit-only outputs:
+
+- `aggregate/sampling_time_audit.csv`
+- `aggregate/sampling_time_audit_summary.json`
+- `aggregate/overfitting_audit.csv`
+- `aggregate/overfitting_method_summary.csv`
+- `aggregate/checkpoint_manifest.csv`
+- `aggregate/order_sensitivity_predictions.csv` when future runs saved per-block order predictions
+- `aggregate/order_sensitivity_oof_summary.csv` when per-block order predictions are available
+
+The sampling-time audit reports the nominal clean4 grids observed in the exported block metadata. For example, stimulus blocks may use `[10,14,18,22]` while no-stimulus blocks may use `[8,12,16,20]`. This is reported as the phase relationship between the original 4-second sampling grid and 30-second block boundaries; the audit does not automatically label it as leakage and does not modify or interpolate data.
+
+Legacy `block_clean4_binary_v1` neural runs did not save checkpoints or per-block order-sensitivity predictions. Their checkpoint manifest rows are therefore marked `not_available_for_legacy_run`, and no per-block order predictions are reconstructed.
+
+## FCNN Multiframe Binary Benchmark
+
+Static implementation/data audit:
+
+```bash
+.venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
+  --stage dry-run \
+  --tasks binary \
+  --sessions 708 709 710 807 813 817 822 \
+  --methods fcnn_late_fusion fcnn_meanpool fcnn_lstm
+```
+
+Smoke test, isolated from the legacy CNN run:
+
+```bash
+.venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
+  --stage smoke \
+  --tasks binary \
+  --sessions 710 \
+  --methods fcnn_late_fusion fcnn_meanpool fcnn_lstm \
+  --seeds 0 \
+  --max-epochs 2 \
+  --run-name block_clean4_binary_fcnn_smoke_v1 \
+  --overwrite
+```
+
+Formal FCNN binary benchmark:
+
+```bash
+.venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
+  --stage benchmark \
+  --tasks binary \
+  --sessions 708 709 710 807 813 817 822 \
+  --methods fcnn_late_fusion fcnn_meanpool fcnn_lstm \
+  --seeds 0 1 2 \
+  --max-epochs 40 \
+  --batch-size 16 \
+  --learning-rate 1e-3 \
+  --weight-decay 1e-3 \
+  --device auto \
+  --run-name block_clean4_binary_fcnn_v1
+```
+
+Each neural fold saves:
+
+- `session_{session}/checkpoints/{method}/seed_{seed}/fold_{fold}/checkpoint.pt`
+- `session_{session}/checkpoint_manifest.csv`
+
+Order-sensitive methods additionally save:
+
+- `session_{session}/order_sensitivity_predictions.csv`
+- `session_{session}/order_sensitivity_oof_summary.csv`
+
+Use `--reuse-compatible-results` only when you want to skip an existing session after validating that the split, data version, input shape, optimizer settings, seeds, normalization, model architecture, and config version match exactly.
+
+## Merge Legacy CNN and FCNN Runs
+
+```bash
+.venv/bin/python scripts/multiframe/merge_multiframe_runs.py \
+  --base-run results/runs/multiframe/block_clean4_binary_v1 \
+  --additional-run results/runs/multiframe/block_clean4_binary_fcnn_v1 \
+  --output-run results/runs/multiframe/block_clean4_binary_all_models_v1
+```
+
+The merge stops if task, sessions, data version, cycle splits, class mapping, normalization protocol, max epochs, optimizer settings, or seed lists differ. It does not invent legacy checkpoints or legacy per-block order predictions.
+
+## Independent Sensitivity Experiments
+
+Epoch sensitivity, separate from the formal 40-epoch benchmark:
+
+```bash
+.venv/bin/python scripts/multiframe/run_epoch_sensitivity.py \
+  --sessions 710 807 813 817 822 \
+  --methods cnn2d_lstm cnn2d_temporal1d fcnn_lstm \
+  --epochs 10 20 40 \
+  --seeds 0 1 2 \
+  --device auto
+```
+
+Frame-count/window ablation, separate from the formal benchmark:
+
+```bash
+.venv/bin/python scripts/multiframe/run_frame_count_ablation.py \
+  --sessions 708 709 710 \
+  --methods cnn2d_meanpool cnn2d_lstm cnn2d_temporal1d fcnn_meanpool fcnn_lstm \
+  --seeds 0 1 2 \
+  --max-epochs 40 \
+  --device auto
 ```
 
 ## Outputs
