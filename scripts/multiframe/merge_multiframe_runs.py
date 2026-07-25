@@ -79,6 +79,58 @@ def session_dirs(run: Path) -> dict[str, Path]:
     return out
 
 
+def run_dir_diagnostic(run: Path) -> str:
+    if not run.exists():
+        return f"{run} does not exist."
+    if not run.is_dir():
+        return f"{run} exists but is not a directory."
+    children = sorted(path.name for path in run.iterdir()) if run.is_dir() else []
+    preview = ", ".join(children[:12]) if children else "(empty)"
+    if len(children) > 12:
+        preview += ", ..."
+    nested = [child for child in sorted(run.iterdir()) if child.is_dir() and session_dirs(child)]
+    nested_text = ""
+    if nested:
+        nested_text = "\nNested run directories with session_* were found:\n  - " + "\n  - ".join(str(path) for path in nested)
+    return (
+        f"{run} exists but has no direct session_* directories. Immediate entries: {preview}."
+        f"{nested_text}"
+    )
+
+
+def resolve_run_dir(run: Path, label: str) -> Path:
+    direct_sessions = session_dirs(run)
+    if direct_sessions:
+        return run
+
+    nested = [
+        child
+        for child in sorted(run.iterdir())
+        if run.exists() and run.is_dir() and child.is_dir() and session_dirs(child)
+    ] if run.exists() and run.is_dir() else []
+    if len(nested) == 1:
+        resolved = nested[0]
+        print(f"[merge] {label} has no direct session_* directories; using nested run directory {resolved}")
+        return resolved
+
+    hint = run_dir_diagnostic(run)
+    raise ValueError(
+        f"{label} is not a valid multiframe run directory.\n"
+        f"{hint}\n\n"
+        "A valid run directory must contain session directories such as session_708/config.json.\n"
+        "To inspect the server output, run:\n"
+        f"  find {run} -maxdepth 2 -type d | sort\n\n"
+        "If the FCNN benchmark has not been run yet, create the additional run first, for example:\n"
+        "  python scripts/multiframe/run_multiframe_benchmark.py \\\n"
+        "    --stage benchmark --tasks binary \\\n"
+        "    --sessions 708 709 710 807 813 817 822 \\\n"
+        "    --methods fcnn_late_fusion fcnn_meanpool fcnn_lstm \\\n"
+        "    --seeds 0 1 2 --max-epochs 40 --batch-size 16 \\\n"
+        "    --learning-rate 1e-3 --weight-decay 1e-3 --device auto \\\n"
+        "    --run-name block_clean4_binary_fcnn_v1"
+    )
+
+
 def read_session_csvs(run: Path, filename: str) -> pd.DataFrame:
     frames = []
     for path in sorted(run.glob(f"session_*/{filename}")):
@@ -296,8 +348,8 @@ def write_analysis(path: Path, master: pd.DataFrame, overfitting_summary: pd.Dat
 
 def main() -> None:
     args = parse_args()
-    base_run = args.base_run.resolve()
-    additional_run = args.additional_run.resolve()
+    base_run = resolve_run_dir(args.base_run.resolve(), "base-run")
+    additional_run = resolve_run_dir(args.additional_run.resolve(), "additional-run")
     output_run = args.output_run.resolve()
     methods, task, sessions, seeds = check_compatibility(base_run, additional_run)
     if output_run.exists():
