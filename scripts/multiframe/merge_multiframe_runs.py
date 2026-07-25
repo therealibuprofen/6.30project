@@ -135,7 +135,10 @@ def read_session_csvs(run: Path, filename: str) -> pd.DataFrame:
     frames = []
     for path in sorted(run.glob(f"session_*/{filename}")):
         if path.exists() and path.stat().st_size > 0:
-            frames.append(pd.read_csv(path))
+            try:
+                frames.append(pd.read_csv(path))
+            except pd.errors.EmptyDataError:
+                print(f"[merge] skipping empty CSV with no columns: {path}")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
