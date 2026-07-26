@@ -32,6 +32,13 @@ merge_script = importlib.util.module_from_spec(MERGE_SPEC)
 sys.modules[MERGE_SPEC.name] = merge_script
 MERGE_SPEC.loader.exec_module(merge_script)
 
+EPOCH_SCRIPT_PATH = PROJECT_DIR / "scripts" / "multiframe" / "run_epoch_sensitivity.py"
+EPOCH_SPEC = importlib.util.spec_from_file_location("run_epoch_sensitivity", EPOCH_SCRIPT_PATH)
+assert EPOCH_SPEC is not None and EPOCH_SPEC.loader is not None
+epoch_script = importlib.util.module_from_spec(EPOCH_SPEC)
+sys.modules[EPOCH_SPEC.name] = epoch_script
+EPOCH_SPEC.loader.exec_module(epoch_script)
+
 from ultrasound_decoding.cv import grouped_cv_splits
 from ultrasound_decoding.linear import ClassContrastivePCATransformer
 from ultrasound_decoding.deep import FCNN
@@ -362,6 +369,64 @@ class MultiframeBenchmarkTests(unittest.TestCase):
         self.assertIn("log", captured_scales)
         self.assertTrue(captured_ticks)
         self.assertTrue((np.asarray(captured_ticks, dtype=float) > 0).all())
+
+    def test_epoch_sensitivity_gap_keeps_epoch_specific_final_history(self) -> None:
+        fold_rows = []
+        history_rows = []
+        for epochs, train_accuracy, train_loss in [(10, 0.61, 0.9), (20, 0.72, 0.6), (40, 0.93, 0.2)]:
+            fold_rows.append(
+                {
+                    "session": "710",
+                    "task": "binary",
+                    "method": "fcnn_lstm",
+                    "seed": 0,
+                    "fold": 1,
+                    "epochs": epochs,
+                    "n_train_blocks": 64,
+                    "n_test_blocks": 8,
+                    "accuracy": 0.5 + epochs / 200.0,
+                    "balanced_accuracy": 0.4 + epochs / 200.0,
+                }
+            )
+            history_rows.append(
+                {
+                    "session": "710",
+                    "task": "binary",
+                    "method": "fcnn_lstm",
+                    "seed": 0,
+                    "fold": 1,
+                    "epochs": epochs,
+                    "epoch": 1,
+                    "train_accuracy": 0.1,
+                    "train_loss": 2.0,
+                }
+            )
+            history_rows.append(
+                {
+                    "session": "710",
+                    "task": "binary",
+                    "method": "fcnn_lstm",
+                    "seed": 0,
+                    "fold": 1,
+                    "epochs": epochs,
+                    "epoch": epochs,
+                    "train_accuracy": train_accuracy,
+                    "train_loss": train_loss,
+                }
+            )
+        gap = epoch_script.fixed_train_test_gap_table(pd.DataFrame(fold_rows), pd.DataFrame(history_rows))
+        self.assertEqual(len(gap), 3)
+        self.assertFalse(gap.duplicated(["session", "method", "epochs", "seed", "fold"]).any())
+        by_epoch = gap.set_index("epochs")
+        self.assertEqual(int(by_epoch.loc[10, "final_epoch"]), 10)
+        self.assertEqual(int(by_epoch.loc[20, "final_epoch"]), 20)
+        self.assertEqual(int(by_epoch.loc[40, "final_epoch"]), 40)
+        self.assertAlmostEqual(float(by_epoch.loc[10, "final_train_accuracy"]), 0.61)
+        self.assertAlmostEqual(float(by_epoch.loc[20, "final_train_loss"]), 0.6)
+        self.assertAlmostEqual(
+            float(by_epoch.loc[40, "generalization_gap"]),
+            float(by_epoch.loc[40, "final_train_accuracy"] - by_epoch.loc[40, "test_balanced_accuracy"]),
+        )
 
     def test_results_and_protocol_constants_are_explicit(self) -> None:
         self.assertEqual(CHANCE_LEVEL, 0.5)
