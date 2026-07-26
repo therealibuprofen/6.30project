@@ -236,6 +236,7 @@ def plot_selected_methods(master: pd.DataFrame, task: str, out_dir: Path, stem: 
     summary = summary[(summary["task"] == task) & (summary["method"].isin(methods))].copy()
     if summary.empty:
         return []
+    summary["session"] = summary["session"].astype(str)
     sessions = sorted(summary["session"].astype(str).unique().tolist(), key=lambda value: int(value))
     methods = [method for method in methods if method in set(summary["method"])]
     x = np.arange(len(sessions), dtype=float)
@@ -277,6 +278,7 @@ def plot_fcnn_order_sensitivity(order_oof: pd.DataFrame, task: str, out_dir: Pat
     if df.empty:
         return []
     grouped = df.groupby(["session", "order_condition"], sort=True)["balanced_accuracy"].mean().reset_index()
+    grouped["session"] = grouped["session"].astype(str)
     sessions = sorted(grouped["session"].astype(str).unique().tolist(), key=lambda value: int(value))
     conditions = ["original", "reverse", "fixed_shuffle"]
     labels = {"original": "Original", "reverse": "Reverse", "fixed_shuffle": "Fixed shuffle"}

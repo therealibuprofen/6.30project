@@ -73,6 +73,7 @@ def plot_method_comparison(master: pd.DataFrame, task: str, out_dir: Path, stem:
     summary = summary[summary["task"] == task].copy()
     if summary.empty:
         return []
+    summary["session"] = summary["session"].astype(str)
     sessions = sorted(summary["session"].astype(str).unique().tolist(), key=lambda value: int(value))
     x = np.arange(len(sessions), dtype=float)
     methods = [method for method in METHOD_ORDER if method in set(summary["method"])]
@@ -116,6 +117,7 @@ def plot_temporal_gain(master: pd.DataFrame, task: str, out_dir: Path, stem: str
     summary = summary[summary["task"] == task].copy()
     if summary.empty:
         return []
+    summary["session"] = summary["session"].astype(str)
     pivot = summary.pivot_table(
         index="session",
         columns="method",
@@ -167,6 +169,7 @@ def plot_order_sensitivity(order_df: pd.DataFrame, task: str, out_dir: Path, ste
         .mean()
         .reset_index()
     )
+    grouped["session"] = grouped["session"].astype(str)
     sessions = sorted(grouped["session"].astype(str).unique().tolist(), key=lambda value: int(value))
     methods = [method for method in ["cnn2d_lstm", "cnn2d_temporal1d", "fcnn_lstm"] if method in set(grouped["method"])]
     if not methods:
@@ -267,6 +270,7 @@ def plot_block_type_accuracy(block_type_df: pd.DataFrame, task: str, out_dir: Pa
     df = block_type_df[block_type_df["task"] == task].copy() if not block_type_df.empty else pd.DataFrame()
     if df.empty:
         return []
+    df["session"] = df["session"].astype(str)
     sessions = sorted(df["session"].astype(str).unique().tolist(), key=lambda value: int(value))
     methods = [method for method in METHOD_ORDER if method in set(df["method"])]
     block_cols = [
@@ -343,11 +347,23 @@ def plot_parameter_count_vs_test_ba(master: pd.DataFrame, task: str, out_dir: Pa
     summary["session"] = summary["session"].astype(str)
     params["session"] = params["session"].astype(str)
     summary = summary.merge(params, on=["session", "task", "method"], how="left")
+    summary["model_parameters"] = pd.to_numeric(summary["model_parameters"], errors="coerce")
+    summary = summary.dropna(subset=["model_parameters"])
+    if summary.empty:
+        return []
+    positive_params = summary.loc[summary["model_parameters"] > 0, "model_parameters"].astype(float)
+    zero_anchor = max(1.0, float(positive_params.min()) / 10.0) if not positive_params.empty else 1.0
+    if not positive_params.empty and any(np.isclose(positive_params, zero_anchor)):
+        zero_anchor = max(0.1, zero_anchor / 10.0)
+    summary["model_parameters_plot"] = summary["model_parameters"].astype(float).where(
+        summary["model_parameters"].astype(float) > 0,
+        zero_anchor,
+    )
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
     for method in [method for method in METHOD_ORDER if method in set(summary["method"])]:
         subset = summary[summary["method"] == method]
         ax.scatter(
-            subset["model_parameters"].astype(float),
+            subset["model_parameters_plot"].astype(float),
             subset["balanced_accuracy_mean"].astype(float),
             s=34,
             color=METHOD_COLORS.get(method, "#777777"),
@@ -355,7 +371,17 @@ def plot_parameter_count_vs_test_ba(master: pd.DataFrame, task: str, out_dir: Pa
             alpha=0.9,
         )
     ax.axhline(CHANCE_LEVEL, color="#333333", linestyle="--", linewidth=1.0)
-    ax.set_xscale("symlog", linthresh=1)
+    ax.set_xscale("log")
+    positive_tick_values = sorted(
+        {
+            float(value)
+            for value in summary.loc[summary["model_parameters"] > 0, "model_parameters"].unique().tolist()
+        }
+    )
+    tick_values = [zero_anchor, *positive_tick_values]
+    tick_labels = ["0 (linear)", *[f"{int(value):,}" for value in positive_tick_values]]
+    ax.set_xticks(tick_values)
+    ax.set_xticklabels(tick_labels, rotation=25, ha="right")
     ax.set_xlabel("Trainable parameters")
     ax.set_ylabel("Balanced Accuracy")
     ax.set_ylim(0.0, 1.02)

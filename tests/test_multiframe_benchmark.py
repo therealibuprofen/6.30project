@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 
+import matplotlib.axes
 import numpy as np
 import pandas as pd
 import torch
@@ -24,6 +25,13 @@ multiframe_script = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = multiframe_script
 SPEC.loader.exec_module(multiframe_script)
 
+MERGE_SCRIPT_PATH = PROJECT_DIR / "scripts" / "multiframe" / "merge_multiframe_runs.py"
+MERGE_SPEC = importlib.util.spec_from_file_location("merge_multiframe_runs", MERGE_SCRIPT_PATH)
+assert MERGE_SPEC is not None and MERGE_SPEC.loader is not None
+merge_script = importlib.util.module_from_spec(MERGE_SPEC)
+sys.modules[MERGE_SPEC.name] = merge_script
+MERGE_SPEC.loader.exec_module(merge_script)
+
 from ultrasound_decoding.cv import grouped_cv_splits
 from ultrasound_decoding.linear import ClassContrastivePCATransformer
 from ultrasound_decoding.deep import FCNN
@@ -34,6 +42,7 @@ from ultrasound_decoding.multiframe.dataset import (
     task_run_dir_name,
 )
 from ultrasound_decoding.multiframe.evaluation import CHANCE_LEVEL, metrics_with_flags
+from ultrasound_decoding.multiframe.plotting import plot_parameter_count_vs_test_ba
 from ultrasound_decoding.multiframe.models import (
     CNN2DLSTM,
     CNN2DMeanPool,
@@ -283,6 +292,76 @@ class MultiframeBenchmarkTests(unittest.TestCase):
         self.assertEqual(rows.groupby("block_id")["truth"].nunique().max(), 1)
         self.assertIn("prob_no_stimulus", rows.columns)
         self.assertIn("prob_stimulus", rows.columns)
+
+    def test_fcnn_order_plot_handles_integer_session_index(self) -> None:
+        order_oof = pd.DataFrame(
+            {
+                "session": [708, 708, 708, 709, 709, 709],
+                "task": ["binary"] * 6,
+                "method": ["fcnn_lstm"] * 6,
+                "seed": [0] * 6,
+                "order_condition": ["original", "reverse", "fixed_shuffle"] * 2,
+                "balanced_accuracy": [0.8, 0.6, 0.7, 0.75, 0.55, 0.65],
+            }
+        )
+        captured_heights: list[float] = []
+        original_bar = matplotlib.axes.Axes.bar
+
+        def capture_bar(ax, x, height, *args, **kwargs):
+            captured_heights.extend(np.asarray(height, dtype=float).reshape(-1).tolist())
+            return original_bar(ax, x, height, *args, **kwargs)
+
+        matplotlib.axes.Axes.bar = capture_bar
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                paths = merge_script.plot_fcnn_order_sensitivity(order_oof, "binary", Path(tmpdir))
+        finally:
+            matplotlib.axes.Axes.bar = original_bar
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(captured_heights)
+        self.assertTrue(np.isfinite(np.asarray(captured_heights, dtype=float)).all())
+        self.assertIn(0.8, captured_heights)
+
+    def test_parameter_count_plot_uses_positive_log_axis_for_zero_parameter_models(self) -> None:
+        master = pd.DataFrame(
+            {
+                "session": [708, 708],
+                "task": ["binary", "binary"],
+                "method": ["pca_lda_flat4", "fcnn_lstm"],
+                "method_display": ["PCA+LDA flat4", "FCNN-LSTM"],
+                "seed": [0, 0],
+                "model_parameters": [0, 48437],
+                "accuracy": [0.7, 0.8],
+                "balanced_accuracy": [0.7, 0.8],
+                "macro_f1": [0.7, 0.8],
+                "prediction_is_single_class": [False, False],
+            }
+        )
+        captured_scales: list[str] = []
+        captured_ticks: list[float] = []
+        original_set_xscale = matplotlib.axes.Axes.set_xscale
+        original_set_xticks = matplotlib.axes.Axes.set_xticks
+
+        def capture_set_xscale(ax, value, *args, **kwargs):
+            captured_scales.append(str(value))
+            return original_set_xscale(ax, value, *args, **kwargs)
+
+        def capture_set_xticks(ax, ticks, *args, **kwargs):
+            captured_ticks.extend(np.asarray(ticks, dtype=float).reshape(-1).tolist())
+            return original_set_xticks(ax, ticks, *args, **kwargs)
+
+        matplotlib.axes.Axes.set_xscale = capture_set_xscale
+        matplotlib.axes.Axes.set_xticks = capture_set_xticks
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                paths = plot_parameter_count_vs_test_ba(master, "binary", Path(tmpdir), "parameter_count_vs_test_ba")
+        finally:
+            matplotlib.axes.Axes.set_xscale = original_set_xscale
+            matplotlib.axes.Axes.set_xticks = original_set_xticks
+        self.assertEqual(len(paths), 2)
+        self.assertIn("log", captured_scales)
+        self.assertTrue(captured_ticks)
+        self.assertTrue((np.asarray(captured_ticks, dtype=float) > 0).all())
 
     def test_results_and_protocol_constants_are_explicit(self) -> None:
         self.assertEqual(CHANCE_LEVEL, 0.5)
