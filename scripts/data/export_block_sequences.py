@@ -27,8 +27,10 @@ from ultrasound_decoding.io import frame_index, session_mat_files
 from ultrasound_decoding.labels import STIMULUS_BLOCKS
 
 
-TARGET_SESSIONS = ["708", "709", "710", "807", "813", "817", "822"]
+TARGET_SESSIONS = ["626", "628", "708", "709", "710", "807", "813", "817", "822"]
 EXPECTED_COMPLETE_CYCLES = {
+    "626": 8,
+    "628": 8,
     "708": 6,
     "709": 22,
     "710": 18,
@@ -767,8 +769,8 @@ def write_readme(output_dir: Path, manifest: pd.DataFrame, version: dict[str, An
         ".venv/bin/python scripts/data/export_block_sequences.py --dry-run",
         ".venv/bin/python scripts/data/export_block_sequences.py --sessions 708 --overwrite",
         ".venv/bin/python scripts/data/inspect_block_sequences.py --sessions 708 --preview-blocks 3",
-        ".venv/bin/python scripts/data/export_block_sequences.py --sessions 708 709 710 807 813 817 822 --overwrite",
-        ".venv/bin/python scripts/data/inspect_block_sequences.py --sessions 708 709 710 807 813 817 822",
+        ".venv/bin/python scripts/data/export_block_sequences.py --sessions 626 628 708 709 710 807 813 817 822 --overwrite",
+        ".venv/bin/python scripts/data/inspect_block_sequences.py --sessions 626 628 708 709 710 807 813 817 822",
         "```",
         "",
         f"本次生成命令：`{command_line}`",

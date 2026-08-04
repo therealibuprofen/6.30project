@@ -39,11 +39,19 @@ epoch_script = importlib.util.module_from_spec(EPOCH_SPEC)
 sys.modules[EPOCH_SPEC.name] = epoch_script
 EPOCH_SPEC.loader.exec_module(epoch_script)
 
+EXPORT_SCRIPT_PATH = PROJECT_DIR / "scripts" / "data" / "export_block_sequences.py"
+EXPORT_SPEC = importlib.util.spec_from_file_location("export_block_sequences", EXPORT_SCRIPT_PATH)
+assert EXPORT_SPEC is not None and EXPORT_SPEC.loader is not None
+export_block_sequences = importlib.util.module_from_spec(EXPORT_SPEC)
+sys.modules[EXPORT_SPEC.name] = export_block_sequences
+EXPORT_SPEC.loader.exec_module(export_block_sequences)
+
 from ultrasound_decoding.cv import grouped_cv_splits
 from ultrasound_decoding.linear import ClassContrastivePCATransformer
 from ultrasound_decoding.deep import FCNN
 from ultrasound_decoding.multiframe.dataset import (
     EXPECTED_BLOCK_SHAPE,
+    EXPECTED_SESSIONS,
     TASK_CLASS_NAMES,
     load_block_sequence_session,
     task_run_dir_name,
@@ -431,6 +439,11 @@ class MultiframeBenchmarkTests(unittest.TestCase):
     def test_results_and_protocol_constants_are_explicit(self) -> None:
         self.assertEqual(CHANCE_LEVEL, 0.5)
         self.assertEqual(multiframe_script.DEFAULT_SEEDS, [0, 1, 2])
+        for session in ["626", "628"]:
+            self.assertIn(session, EXPECTED_SESSIONS)
+            self.assertIn(session, export_block_sequences.TARGET_SESSIONS)
+        self.assertEqual(export_block_sequences.EXPECTED_COMPLETE_CYCLES["626"], 8)
+        self.assertEqual(export_block_sequences.EXPECTED_COMPLETE_CYCLES["628"], 8)
         self.assertTrue(METHOD_USES_TEMPORAL_ORDER["cnn2d_lstm"])
         self.assertTrue(METHOD_USES_TEMPORAL_ORDER["cnn2d_temporal1d"])
         self.assertTrue(METHOD_USES_TEMPORAL_ORDER["fcnn_lstm"])

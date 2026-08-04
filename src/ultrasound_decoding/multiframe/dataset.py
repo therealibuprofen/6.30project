@@ -14,7 +14,7 @@ from ultrasound_decoding.cv import grouped_cv_splits
 
 BLOCK_SEQUENCE_VERSION = "block_sequences_v1"
 EXPECTED_BLOCK_SHAPE = (4, 128, 501)
-EXPECTED_SESSIONS = ["708", "709", "710", "807", "813", "817", "822"]
+EXPECTED_SESSIONS = ["626", "628", "708", "709", "710", "807", "813", "817", "822"]
 EXPECTED_TASKS = ["binary", "stimulus_type"]
 BLOCK_NAMES = ["grating", "stop_after_grating", "dot", "static"]
 STIMULUS_BLOCK_NAMES = ["grating", "dot"]

@@ -39,6 +39,10 @@ processed_data/block_sequences_v1/
 The directory should contain:
 
 ```text
+session_626_blocks.h5
+session_626_block_metadata.csv
+session_628_blocks.h5
+session_628_block_metadata.csv
 session_708_blocks.h5
 session_708_block_metadata.csv
 session_709_blocks.h5
@@ -79,7 +83,7 @@ Then regenerate and inspect `block_sequences_v1`:
 
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage dry-run \
-  --sessions 708 709 710 807 813 817 822 \
+  --sessions 626 628 708 709 710 807 813 817 822 \
   --tasks binary stimulus_type
 
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
@@ -114,7 +118,7 @@ All-session binary benchmark. If Stage 2 completed in the default output directo
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage benchmark \
   --tasks binary \
-  --sessions 708 709 710 807 813 817 822 \
+  --sessions 626 628 708 709 710 807 813 817 822 \
   --methods pca_lda_flat4 cpca_lda_flat4 cnn2d_meanpool cnn2d_lstm cnn2d_temporal1d single_frame_late_fusion \
   --seeds 0 1 2 \
   --max-epochs 40 \
@@ -133,7 +137,7 @@ All-session stimulus_type benchmark.
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage benchmark \
   --tasks stimulus_type \
-  --sessions 708 709 710 807 813 817 822 \
+  --sessions 626 628 708 709 710 807 813 817 822 \
   --methods pca_lda_flat4 cpca_lda_flat4 cnn2d_meanpool cnn2d_lstm cnn2d_temporal1d single_frame_late_fusion \
   --seeds 0 1 2 \
   --max-epochs 40 \
@@ -150,12 +154,12 @@ All-session stimulus_type benchmark.
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage aggregate-only \
   --tasks binary \
-  --sessions 708 709 710 807 813 817 822
+  --sessions 626 628 708 709 710 807 813 817 822
 
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage aggregate-only \
   --tasks stimulus_type \
-  --sessions 708 709 710 807 813 817 822
+  --sessions 626 628 708 709 710 807 813 817 822
 ```
 
 `aggregate-only` does not train models. It rebuilds aggregate CSVs/plots plus the audit-only outputs:
@@ -180,7 +184,7 @@ Static implementation/data audit:
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage dry-run \
   --tasks binary \
-  --sessions 708 709 710 807 813 817 822 \
+  --sessions 626 628 708 709 710 807 813 817 822 \
   --methods fcnn_late_fusion fcnn_meanpool fcnn_lstm
 ```
 
@@ -204,7 +208,7 @@ Formal FCNN binary benchmark:
 .venv/bin/python scripts/multiframe/run_multiframe_benchmark.py \
   --stage benchmark \
   --tasks binary \
-  --sessions 708 709 710 807 813 817 822 \
+  --sessions 626 628 708 709 710 807 813 817 822 \
   --methods fcnn_late_fusion fcnn_meanpool fcnn_lstm \
   --seeds 0 1 2 \
   --max-epochs 40 \
