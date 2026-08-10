@@ -177,52 +177,119 @@ def config_value(config: dict[str, Any], dotted: str) -> Any:
     return value
 
 
+def read_run_configs(run: Path) -> dict[str, dict[str, Any]]:
+    configs: dict[str, dict[str, Any]] = {}
+    for session, session_dir in session_dirs(run).items():
+        config_path = session_dir / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"missing config.json for {run}/session_{session}")
+        configs[str(session)] = read_json(config_path)
+    return configs
+
+
+def coverage_from_master(master: pd.DataFrame, run: Path, label: str) -> set[tuple[str, str]]:
+    if master.empty:
+        raise ValueError(f"{label} has no master_summary.csv rows under {run}")
+    required = {"session", "method"}
+    missing = required - set(master.columns)
+    if missing:
+        raise ValueError(f"{label} master_summary.csv is missing columns: {sorted(missing)}")
+    frame = master.copy()
+    frame["session"] = frame["session"].astype(str)
+    frame["method"] = frame["method"].astype(str)
+    return set(zip(frame["session"], frame["method"]))
+
+
+def duplicate_count(frame: pd.DataFrame, columns: list[str]) -> int:
+    if frame.empty or not set(columns).issubset(frame.columns):
+        return 0
+    subset = frame[columns].copy()
+    for column in columns:
+        subset[column] = subset[column].fillna("__NA__").astype(str)
+    return int(subset.duplicated().sum())
+
+
+def validate_merged_tables(frames: dict[str, pd.DataFrame]) -> None:
+    checks = {
+        "master_summary.csv": ["session", "task", "method", "seed"],
+        "fold_summary.csv": ["session", "task", "method", "seed", "fold"],
+        "predictions.csv": ["session", "task", "method", "seed", "fold", "block_id"],
+        "training_history.csv": ["session", "task", "method", "seed", "fold", "epoch"],
+        "order_sensitivity.csv": ["session", "task", "method", "seed", "fold"],
+        "order_sensitivity_predictions.csv": ["session", "task", "method", "seed", "fold", "block_id", "order_condition"],
+        "order_sensitivity_oof_summary.csv": ["session", "task", "method", "seed", "order_condition"],
+    }
+    errors = []
+    for filename, columns in checks.items():
+        count = duplicate_count(frames.get(filename, pd.DataFrame()), columns)
+        if count:
+            errors.append(f"{filename}: {count} duplicate rows for key {columns}")
+    if errors:
+        raise ValueError("merged result tables contain duplicate keys:\n  - " + "\n  - ".join(errors))
+
+
 def check_compatibility(base_run: Path, additional_run: Path) -> tuple[list[str], str, list[str], list[int]]:
     base_sessions = session_dirs(base_run)
     add_sessions = session_dirs(additional_run)
-    if set(base_sessions) != set(add_sessions):
-        raise ValueError(f"sessions differ: base={sorted(base_sessions)} additional={sorted(add_sessions)}")
-    sessions = sorted(base_sessions, key=lambda value: int(value))
+    base_configs = read_run_configs(base_run)
+    add_configs = read_run_configs(additional_run)
+    sessions = sorted(set(base_sessions) | set(add_sessions), key=lambda value: int(value))
     errors: list[str] = []
     task_values: set[str] = set()
     seeds_values: set[tuple[int, ...]] = set()
-    base_methods: set[str] = set()
-    add_methods: set[str] = set()
+    base_master = read_session_csvs(base_run, "master_summary.csv")
+    add_master = read_session_csvs(additional_run, "master_summary.csv")
+    base_coverage = coverage_from_master(base_master, base_run, "base-run")
+    add_coverage = coverage_from_master(add_master, additional_run, "additional-run")
+    overlap = sorted(base_coverage & add_coverage, key=lambda item: (int(item[0]), item[1]))
+    if overlap:
+        preview = ", ".join(f"{session}/{method}" for session, method in overlap[:20])
+        if len(overlap) > 20:
+            preview += ", ..."
+        errors.append(f"both runs contain results for the same session/method: {preview}")
 
     for session in sessions:
-        base_cfg = read_json(base_sessions[session] / "config.json")
-        add_cfg = read_json(add_sessions[session] / "config.json")
-        task_values.update([str(base_cfg.get("task")), str(add_cfg.get("task"))])
-        seeds_values.update([tuple(int(value) for value in base_cfg.get("seeds", [])), tuple(int(value) for value in add_cfg.get("seeds", []))])
-        base_methods.update(str(value) for value in base_cfg.get("methods", []))
-        add_methods.update(str(value) for value in add_cfg.get("methods", []))
-        for key in ["task", "input_shape", "data_version", "cv_group", "max_folds"]:
-            if base_cfg.get(key) != add_cfg.get(key):
-                errors.append(f"session {session}: {key} differs ({base_cfg.get(key)!r} vs {add_cfg.get(key)!r})")
-        for key in ["deep_config.optimizer", "deep_config.lr", "deep_config.weight_decay", "deep_config.batch_size", "deep_config.max_epochs", "deep_config.loss"]:
-            if config_value(base_cfg, key) != config_value(add_cfg, key):
-                errors.append(f"session {session}: {key} differs ({config_value(base_cfg, key)!r} vs {config_value(add_cfg, key)!r})")
-        if normalize_mapping(base_cfg.get("class_mapping"), str(base_cfg.get("task"))) != normalize_mapping(
-            add_cfg.get("class_mapping"),
-            str(add_cfg.get("task")),
-        ):
-            errors.append(f"session {session}: class mapping differs")
-        if not split_frame(base_sessions[session] / "split_manifest.csv").equals(split_frame(add_sessions[session] / "split_manifest.csv")):
-            errors.append(f"session {session}: split_manifest differs")
+        configs = []
+        if session in base_configs:
+            configs.append(("base-run", base_configs[session], base_sessions[session]))
+        if session in add_configs:
+            configs.append(("additional-run", add_configs[session], add_sessions[session]))
+        for _label, cfg, _session_dir in configs:
+            task_values.add(str(cfg.get("task")))
+            seeds_values.add(tuple(int(value) for value in cfg.get("seeds", [])))
+        if len(configs) == 2:
+            _base_label, base_cfg, base_dir = configs[0]
+            _add_label, add_cfg, add_dir = configs[1]
+            for key in ["task", "input_shape", "data_version", "cv_group", "max_folds"]:
+                if base_cfg.get(key) != add_cfg.get(key):
+                    errors.append(f"session {session}: {key} differs ({base_cfg.get(key)!r} vs {add_cfg.get(key)!r})")
+            for key in ["deep_config.optimizer", "deep_config.lr", "deep_config.weight_decay", "deep_config.batch_size", "deep_config.max_epochs", "deep_config.loss"]:
+                if config_value(base_cfg, key) != config_value(add_cfg, key):
+                    errors.append(f"session {session}: {key} differs ({config_value(base_cfg, key)!r} vs {config_value(add_cfg, key)!r})")
+            if normalize_mapping(base_cfg.get("class_mapping"), str(base_cfg.get("task"))) != normalize_mapping(
+                add_cfg.get("class_mapping"),
+                str(add_cfg.get("task")),
+            ):
+                errors.append(f"session {session}: class mapping differs")
+            if not split_frame(base_dir / "split_manifest.csv").equals(split_frame(add_dir / "split_manifest.csv")):
+                errors.append(f"session {session}: split_manifest differs")
 
     if len(task_values) != 1:
         errors.append(f"task values differ: {sorted(task_values)}")
     if len(seeds_values) != 1:
         errors.append(f"seed lists differ: {sorted(seeds_values)}")
-    if base_methods & add_methods:
-        errors.append(f"methods overlap between runs: {sorted(base_methods & add_methods)}")
     if normalization_protocol(base_run) != normalization_protocol(additional_run):
         errors.append("normalization protocol differs")
     if errors:
         raise ValueError("runs are not merge-compatible:\n  - " + "\n  - ".join(errors))
     task = next(iter(task_values))
     seeds = list(next(iter(seeds_values)))
-    return sorted(base_methods | add_methods, key=lambda method: METHOD_ORDER.index(method) if method in METHOD_ORDER else 999), task, sessions, seeds
+    methods = {method for _session, method in (base_coverage | add_coverage)}
+    print(
+        "[merge] coverage union: "
+        f"sessions={sessions}, methods={sorted(methods, key=lambda method: METHOD_ORDER.index(method) if method in METHOD_ORDER else 999)}"
+    )
+    return sorted(methods, key=lambda method: METHOD_ORDER.index(method) if method in METHOD_ORDER else 999), task, sessions, seeds
 
 
 def write_df(df: pd.DataFrame, path: Path) -> None:
@@ -365,6 +432,7 @@ def main() -> None:
     aggregate_dir.mkdir(parents=True, exist_ok=True)
 
     frames = {filename: pd.concat([read_session_csvs(base_run, filename), read_session_csvs(additional_run, filename)], ignore_index=True) for filename in CSV_FILENAMES}
+    validate_merged_tables(frames)
     if frames["checkpoint_manifest.csv"].empty:
         frames["checkpoint_manifest.csv"] = legacy_checkpoint_manifest(frames["fold_summary.csv"])
     else:

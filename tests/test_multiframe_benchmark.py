@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -377,6 +378,77 @@ class MultiframeBenchmarkTests(unittest.TestCase):
         self.assertIn("log", captured_scales)
         self.assertTrue(captured_ticks)
         self.assertTrue((np.asarray(captured_ticks, dtype=float) > 0).all())
+
+    def test_merge_accepts_complementary_session_method_coverage(self) -> None:
+        def write_session(run_dir: Path, session: str, methods: list[str]) -> None:
+            session_dir = run_dir / f"session_{session}"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            config = {
+                "session": session,
+                "task": "binary",
+                "input_shape": [4, 128, 501],
+                "data_version": "block_sequences_v1_clean4",
+                "cv_group": "cycle",
+                "max_folds": 10,
+                "methods": methods,
+                "seeds": [0, 1, 2],
+                "class_mapping": {"0": "no_stimulus", "1": "stimulus"},
+                "deep_config": {
+                    "optimizer": "adamw",
+                    "lr": 0.001,
+                    "weight_decay": 0.001,
+                    "batch_size": 16,
+                    "max_epochs": 40,
+                    "loss": "cross_entropy",
+                },
+            }
+            (session_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            pd.DataFrame(
+                [
+                    {
+                        "session": session,
+                        "task": "binary",
+                        "fold": 1,
+                        "train_cycles": "1,2",
+                        "test_cycles": "0",
+                        "n_train_blocks": 8,
+                        "n_test_blocks": 4,
+                    }
+                ]
+            ).to_csv(session_dir / "split_manifest.csv", index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "session": session,
+                        "task": "binary",
+                        "method": method,
+                        "seed": 0,
+                        "accuracy": 0.5,
+                        "balanced_accuracy": 0.5,
+                        "macro_f1": 0.5,
+                        "prediction_is_single_class": False,
+                        "model_parameters": 0,
+                    }
+                    for method in methods
+                ]
+            ).to_csv(session_dir / "master_summary.csv", index=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base = root / "base"
+            additional = root / "additional"
+            write_session(base, "626", ["pca_lda_flat4", "fcnn_lstm"])
+            write_session(base, "708", ["pca_lda_flat4"])
+            write_session(additional, "708", ["fcnn_lstm"])
+            methods, task, sessions, seeds = merge_script.check_compatibility(base, additional)
+            self.assertEqual(task, "binary")
+            self.assertEqual(sessions, ["626", "708"])
+            self.assertEqual(seeds, [0, 1, 2])
+            self.assertEqual(set(methods), {"pca_lda_flat4", "fcnn_lstm"})
+
+            write_session(additional, "626", ["fcnn_lstm"])
+            with self.assertRaisesRegex(ValueError, "same session/method"):
+                merge_script.check_compatibility(base, additional)
 
     def test_epoch_sensitivity_gap_keeps_epoch_specific_final_history(self) -> None:
         fold_rows = []
