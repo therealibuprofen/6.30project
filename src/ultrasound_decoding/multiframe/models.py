@@ -107,7 +107,21 @@ class SmallCNNFrameEncoder(nn.Module):
             nn.Flatten(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_spatial_feature_map: bool = False,
+    ) -> torch.Tensor:
+        """Encode one frame, optionally retaining the audited 16 x 4 x 8 map.
+
+        The default path deliberately remains the original ``self.layers(x)``
+        call.  Apart from making old state dictionaries compatible, this keeps
+        the supervised mean-pool forward numerically identical to the version
+        that predates masked-reconstruction pretraining.
+        """
+        if return_spatial_feature_map:
+            return self.layers[:-1](x)
         return self.layers(x)
 
 
