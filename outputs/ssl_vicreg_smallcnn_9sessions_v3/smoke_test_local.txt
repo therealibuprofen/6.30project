@@ -1,0 +1,1 @@
+{"contains_labels": false, "device": "cpu", "downstream_condition": "SSL_FINETUNE", "finite_downstream_test_BA": true, "fold": 1, "formal_scientific_result": false, "projector_in_checkpoint": false, "seed": 20260812, "session": "710", "ssl_optimizer_updates": 2, "status": "PASS", "supervised_epochs": 1, "target_test_frames_seen_by_ssl": 0}
