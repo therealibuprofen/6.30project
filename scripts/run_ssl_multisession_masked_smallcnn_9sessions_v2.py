@@ -736,6 +736,11 @@ def consolidate_downstream(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.D
     prediction_frames = [pd.read_csv(path) for path in sorted((args.output_dir / "downstream/jobs").glob("*.predictions.csv"))]
     metrics = pd.concat([reused_metrics, pd.DataFrame(metric_rows)], ignore_index=True)
     predictions = pd.concat([reused_predictions, *prediction_frames], ignore_index=True)
+    # pandas infers numeric session IDs from the reused v1 CSV, while the new
+    # JSON jobs retain strings. Canonicalize before de-duplication/grouping so
+    # 626 and "626" cannot become separate, half-populated session groups.
+    metrics["session"] = metrics["session"].astype(str)
+    predictions["session"] = predictions["session"].astype(str)
     metric_key = ["session", "task", "fold", "seed", "condition"]
     prediction_key = [*metric_key, "sample_id"]
     metrics = metrics.drop_duplicates(metric_key, keep="last").sort_values(metric_key).reset_index(drop=True)

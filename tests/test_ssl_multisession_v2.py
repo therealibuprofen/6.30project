@@ -321,3 +321,15 @@ def test_28_session_comparison_has_preregistered_columns() -> None:
         "delta_multi_vs_random", "random_gap", "within_gap", "other_gap", "multi_gap",
     }
     assert required <= set(table.columns)
+
+
+def test_29_mixed_numeric_and_string_session_ids_are_canonicalized() -> None:
+    metrics = _complete_fold_metrics()
+    reused = metrics["condition"].isin(("RANDOM_INIT", "WITHIN_SSL_FT"))
+    metrics.loc[reused, "session"] = metrics.loc[reused, "session"].astype(int)
+    table = session_level_comparison(metrics)
+    assert len(table) == 18
+    assert table.groupby("task")["session"].nunique().to_dict() == {
+        "binary": 9,
+        "stimulus_type": 9,
+    }

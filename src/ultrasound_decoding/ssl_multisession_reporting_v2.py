@@ -38,6 +38,8 @@ def session_level_comparison(fold_metrics: pd.DataFrame) -> pd.DataFrame:
     missing = required - set(fold_metrics.columns)
     if missing:
         raise ValueError(f"fold metrics missing columns: {sorted(missing)}")
+    fold_metrics = fold_metrics.copy()
+    fold_metrics["session"] = fold_metrics["session"].astype(str)
     if set(fold_metrics["condition"].unique()) != set(V2_CONDITIONS):
         raise AssertionError("formal fold metrics do not contain exactly four v2 conditions")
     aggregated = (
@@ -155,6 +157,8 @@ def generalization_gap_summary(session_table: pd.DataFrame) -> pd.DataFrame:
 
 
 def seed_stability(fold_metrics: pd.DataFrame) -> pd.DataFrame:
+    fold_metrics = fold_metrics.copy()
+    fold_metrics["session"] = fold_metrics["session"].astype(str)
     return (
         fold_metrics.groupby(["task", "session", "condition", "seed"], sort=True)
         .agg(
