@@ -1,0 +1,13 @@
+PASS: tiny local CPU smoke only; not a formal scientific result
+session=626 task=binary fold=1 seed=20260812
+fractions=0.2,1.0 conditions=RANDOM_INIT,WITHIN_MASKED_SSL_FT
+smoke_epochs=1
+nested_permutation=6,1,5,7,2,4,3
+fraction_0.2_cycles=6
+fraction_1.0_cycles=1,2,3,4,5,6,7
+checkpoint_reused_across_fractions=/Users/ibuprofen/Desktop/6.30project/outputs/ssl_masked_smallcnn_clean4_9sessions_v1/pretraining/checkpoints/session_626/fold_1/seed_20260812.pt
+metric_rows=4
+session_summary_rows=2
+aulc_rows=1
+runtime_seconds=2.919
+schema_check=PASS
