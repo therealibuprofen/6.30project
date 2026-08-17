@@ -1,0 +1,6 @@
+Command: PYTHONPATH=src PYTHONPYCACHEPREFIX=/tmp/v6_pycache MPLBACKEND=Agg MPLCONFIGDIR=/tmp/v6_mpl .venv/bin/python -m pytest -q --color=no
+Result: PASS
+Tests: 493 passed
+Warnings: 14 (existing Matplotlib/PyParsing deprecation warnings)
+Runtime: 40.37 seconds (final post-implementation rerun)
+New v6 test module: tests/test_multisource_csu_v6.py (26 passed)

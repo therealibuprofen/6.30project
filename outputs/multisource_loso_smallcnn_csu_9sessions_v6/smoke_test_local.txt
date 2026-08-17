@@ -1,0 +1,15 @@
+PASS: tiny local CPU smoke only; not a formal scientific result
+target=626 sources=628,708 task=binary seed=20260812
+condition=MULTI_SOURCE_CSU
+training_steps=1
+train_blocks=8 target_probe_blocks=4
+csu_forward_backward=PASS
+finite_loss_gradients_parameters=PASS
+checkpoint_save_load=PASS
+train_mode_csu_can_activate=PASS
+eval_mode_exact_bypass=PASS
+target_labeled_samples_in_training=0
+target_frames_in_training=0
+target_used_for_normalization=False
+output_schema=PASS
+runtime_seconds=0.918
