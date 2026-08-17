@@ -41,6 +41,7 @@ from ultrasound_decoding.cross_session_feature_factor_v7 import (
     missing_formal_outputs,
     multivariate_energy_distance,
     multivariate_factor_sums,
+    load_torch_checkpoint_compat,
     pairwise_session_distances,
     sample_metadata_table,
     source_only_stimulus_probe,
@@ -344,3 +345,30 @@ def test_35_pairwise_distance_schema_has_no_diagonal_rows() -> None:
     rows = pairwise_session_distances(features, metadata["session"].to_numpy(), representation="RAW_SPATIAL_PCA")
     assert len(rows) == 36
     assert (rows["session_a"] != rows["session_b"]).all()
+
+
+def test_36_checkpoint_loader_falls_back_for_old_pytorch(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_load(path, **kwargs):
+        calls.append((path, kwargs))
+        if "weights_only" in kwargs:
+            raise TypeError("'weights_only' is an invalid keyword argument for Unpickler()")
+        return {"status": "old_torch_payload_loaded"}
+
+    monkeypatch.setattr("torch.load", fake_load)
+    payload = load_torch_checkpoint_compat(Path("checkpoint.pt"))
+    assert payload == {"status": "old_torch_payload_loaded"}
+    assert calls == [
+        (Path("checkpoint.pt"), {"map_location": "cpu", "weights_only": False}),
+        (Path("checkpoint.pt"), {"map_location": "cpu"}),
+    ]
+
+
+def test_37_checkpoint_loader_does_not_mask_other_type_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_load(_path, **_kwargs):
+        raise TypeError("unrelated checkpoint type failure")
+
+    monkeypatch.setattr("torch.load", fake_load)
+    with pytest.raises(TypeError, match="unrelated"):
+        load_torch_checkpoint_compat(Path("checkpoint.pt"))

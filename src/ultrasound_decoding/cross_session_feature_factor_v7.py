@@ -1339,6 +1339,22 @@ def save_global_encoder_checkpoint(
     return sha256_file(path)
 
 
+def load_torch_checkpoint_compat(path: Path) -> dict[str, Any]:
+    """Load full checkpoint payloads on both old and new PyTorch releases.
+
+    ``weights_only`` was added after the PyTorch release installed on the
+    project server.  Newer versions warn unless the full-payload intent is
+    explicit, while older versions pass unknown keywords to ``Unpickler`` and
+    raise ``TypeError``.  Retry only for that precise compatibility failure.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu")
+
+
 def load_or_train_global_encoder(
     path: Path,
     pool: SessionFramePool,
@@ -1350,7 +1366,7 @@ def load_or_train_global_encoder(
 ) -> tuple[SmallCNNFrameEncoder, dict[str, Any], dict[str, Any]]:
     expected = global_encoder_expected_config(pool, seed=seed, updates=updates, batch_size=batch_size)
     if path.exists():
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = load_torch_checkpoint_compat(path)
         mismatches = {key: (payload.get(key), value) for key, value in expected.items() if payload.get(key) != value}
         if not mismatches:
             encoder = SmallCNNFrameEncoder()
@@ -1388,7 +1404,7 @@ def load_or_train_global_encoder(
         runtime_seconds=result.runtime_seconds,
         peak_gpu_memory_mb=result.peak_gpu_memory_mb,
     )
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = load_torch_checkpoint_compat(path)
     audit = {
         "seed": seed,
         "checkpoint": str(path),
