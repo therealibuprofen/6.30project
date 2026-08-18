@@ -691,11 +691,16 @@ def build_diagnostic_table(
         ["S1", "S2", "S3"],
         default="S4",
     )
+    relative_scope = (
+        "within this preregistered 9-session sample"
+        if sessions == list(EXPECTED_SESSIONS)
+        else "within this smoke subset (not formal)"
+    )
     descriptions = {
-        "S1": "strong and repeatable condition-associated spatial contrast",
-        "S2": "stable images but weak spatial task contrast",
-        "S3": "spatial response varies substantially across cycles",
-        "S4": "weak and unstable spatial task contrast",
+        "S1": f"relative-high spatial effect and relative-high reproducibility {relative_scope}",
+        "S2": f"relative-low spatial effect and relative-high reproducibility {relative_scope}",
+        "S3": f"relative-high spatial effect and relative-low reproducibility {relative_scope}",
+        "S4": f"relative-low spatial effect and relative-low reproducibility {relative_scope}",
     }
     output["spatial_diagnostic_description"] = output["spatial_diagnostic_pattern"].map(descriptions)
     output["descriptive_effect_threshold"] = effect_threshold

@@ -281,7 +281,7 @@ The primary stimulus-presence contrast and the GS/DS secondary contrasts are the
 
 Effect maps are retained regardless of significance. BH-FDR was applied independently across valid pixels for each session × contrast at q=0.05. {n_any_fdr} of {len(sessions)} analyzed sessions had at least one primary pixel survive the predefined threshold. When a row has zero surviving pixels, the supported statement is: **no pixel survived the predefined FDR threshold**; this is not evidence that no spatial response exists.
 
-Descriptive S1–S4 labels use the analyzed {len(sessions)}-session median splits of RMS standardized effect and split-half Pearson reproducibility. They are visualization aids, not subgroup significance tests. Counts: {pattern_counts}.
+Descriptive S1–S4 labels mean only relative-high/relative-low effect and reproducibility within the analyzed {len(sessions)}-session sample, using sample medians. They are sample-relative visualization aids, not subgroup significance tests. Counts: {pattern_counts}.
 
 ## Planned associations with within-session BA
 

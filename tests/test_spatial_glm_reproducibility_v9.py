@@ -283,6 +283,10 @@ def test_diagnostic_patterns_are_descriptive_median_split_without_subgroup_test(
     diagnostic = build_diagnostic_table(*_summary_frames())
     assert set(diagnostic["spatial_diagnostic_pattern"]).issubset({"S1", "S2", "S3", "S4"})
     assert (diagnostic["threshold_rule"] == "9-session median split; descriptive only; no subgroup test").all()
+    descriptions = diagnostic["spatial_diagnostic_description"].str.lower()
+    assert descriptions.str.contains("relative-high|relative-low", regex=True).all()
+    assert descriptions.str.contains("within this preregistered 9-session sample", regex=False).all()
+    assert not descriptions.str.contains("strong|weak|stable|repeatable", regex=True).any()
     assert diagnostic["session"].tolist() == list(EXPECTED_SESSIONS)
 
 
