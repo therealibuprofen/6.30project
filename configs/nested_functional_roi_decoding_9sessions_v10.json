@@ -1,0 +1,47 @@
+{
+  "run_name": "nested_functional_roi_decoding_9sessions_v10",
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "task": "binary",
+  "input": "block_sequences_v1_clean4",
+  "input_shape": [4, 128, 501],
+  "orientation": {
+    "626": "identity",
+    "628": "identity",
+    "708": "identity",
+    "709": "identity",
+    "710": "identity",
+    "807": "flip_vertical",
+    "813": "identity",
+    "817": "identity",
+    "822": "identity"
+  },
+  "cv": "cycle_grouped_max_10_folds",
+  "max_folds": 10,
+  "decoding_preprocessing": "arcsinh_then_train_fold_feature_standardization",
+  "roi_selection_input": "raw_frozen_clean4_without_arcsinh",
+  "cycle_contrast": "0.5*(grating_mean+dot_mean)-0.5*(stop_after_grating_mean+static_mean)",
+  "z_map": "training_cycle_mean/(training_cycle_std_ddof0+eps)",
+  "eps": 1e-08,
+  "roi_rules": {
+    "functional_roi_top10": 0.1,
+    "functional_roi_top20": 0.2
+  },
+  "top_pixel_tie_rule": "stable_descending_Z_then_flat_index_exact_ceil_fraction",
+  "pca_variance": 0.95,
+  "lda_regularization": 0.001,
+  "models": [
+    "whole_brain_clean4_flat4_pca_lda",
+    "roi_mean4_top10_rlda",
+    "roi_flat4_top10_pca_lda",
+    "roi_mean4_top20_rlda",
+    "roi_flat4_top20_pca_lda"
+  ],
+  "roi_selection_scope": "training_cycles_only_per_session_per_fold",
+  "user_drawn_roi_used": false,
+  "full_session_roi_used": false,
+  "v9_map_used_for_roi": false,
+  "cross_session_transfer": false,
+  "registration": false,
+  "morphology": false,
+  "formal_device": "cpu"
+}
