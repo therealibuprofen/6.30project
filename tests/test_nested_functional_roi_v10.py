@@ -253,3 +253,11 @@ def test_23_only_preregistered_five_models_and_two_roi_rules() -> None:
 
 def test_24_roi_selection_audit_forbids_morphology(mean_only_result) -> None:
     assert all(row["morphology_used"] is False for row in mean_only_result.roi_audit_rows)
+
+
+def test_25_v10_uses_only_git_tracked_decoder_dependencies() -> None:
+    source = inspect.getsource(__import__(
+        "ultrasound_decoding.nested_functional_roi_v10", fromlist=["nested_functional_roi_v10"]
+    ))
+    assert "block_beta_decoding" not in source
+    assert "from ultrasound_decoding.linear import LDAModel, fit_predict_linear" in source

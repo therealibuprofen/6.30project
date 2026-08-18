@@ -18,10 +18,9 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-from ultrasound_decoding.block_beta_decoding import fit_regularized_lda
 from ultrasound_decoding.cv import grouped_cv_splits
 from ultrasound_decoding.evaluate import classification_metrics
-from ultrasound_decoding.linear import fit_predict_linear
+from ultrasound_decoding.linear import LDAModel, fit_predict_linear
 from ultrasound_decoding.multiframe.dataset import (
     BLOCK_NAMES,
     EXPECTED_BLOCK_SHAPE,
@@ -208,7 +207,15 @@ def fit_predict_rlda(
     scale = np.where(scale > 0, scale, 1.0)
     train = (X_train - mean) / scale
     test = (X_test - mean) / scale
-    return fit_regularized_lda(train, y_train, test, reg=LDA_REG)
+    model = LDAModel(reg=LDA_REG).fit(train, y_train)
+    prediction = model.predict(test).astype(np.int64, copy=False)
+    if model.means_ is None or model.inv_cov_ is None or model.priors_ is None:
+        raise AssertionError("regularized LDA fit did not produce model parameters")
+    linear = test @ model.inv_cov_ @ model.means_.T
+    quadratic = 0.5 * np.sum((model.means_ @ model.inv_cov_) * model.means_, axis=1)
+    scores = linear - quadratic + np.log(model.priors_)
+    decision = scores[:, 1] - scores[:, 0]
+    return prediction, decision.astype(np.float64, copy=False)
 
 
 def mask_overlap(mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[float, float]:
