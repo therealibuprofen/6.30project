@@ -1,0 +1,32 @@
+{
+  "run_name": "spatial_glm_contrast_reproducibility_9sessions_v9",
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "condition_order": ["grating", "stop_after_grating", "dot", "static"],
+  "contrast_weights": {
+    "STIM_PRESENCE": [0.5, -0.5, 0.5, -0.5],
+    "GS": [1.0, -1.0, 0.0, 0.0],
+    "DS": [0.0, 0.0, 1.0, -1.0],
+    "GD": [1.0, 0.0, -1.0, 0.0]
+  },
+  "formal_device": "cpu",
+  "n_splits": 1000,
+  "n_bootstrap": 1000,
+  "fdr_alpha": 0.05,
+  "fixed_orientations": {
+    "626": "identity",
+    "628": "identity",
+    "708": "identity",
+    "709": "identity",
+    "710": "identity",
+    "807": "flip_vertical",
+    "813": "identity",
+    "817": "identity",
+    "822": "identity"
+  },
+  "block_frames": 4,
+  "registration": false,
+  "hrf_search": false,
+  "decoder_training": false,
+  "roi_selection": false,
+  "searchlight": false
+}
