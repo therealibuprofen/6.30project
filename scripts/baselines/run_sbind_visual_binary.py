@@ -400,7 +400,18 @@ def update_status(args: argparse.Namespace, plan: pd.DataFrame, run_fingerprint:
         pending = status[status["status"] != "complete"]
         print("NEXT_PENDING " + ", ".join(pending["task_dir"].head(5).tolist()), flush=True)
     else:
-        print(f"COMPLETE_MARKER {args.output_dir / 'RUN_COMPLETE.json'}", flush=True)
+        marker = args.output_dir / "RUN_COMPLETE.json"
+        missing_outputs = [
+            name for name in REQUIRED_FINAL_OUTPUTS if not (args.output_dir / name).exists()
+        ]
+        if marker.exists() and not missing_outputs:
+            print(f"FULLY_COMPLETE marker={marker}", flush=True)
+        else:
+            print(
+                "TASKS_COMPLETE_FINALIZATION_PENDING "
+                f"marker_exists={marker.exists()} missing_outputs={','.join(missing_outputs)}",
+                flush=True,
+            )
     return status
 
 
