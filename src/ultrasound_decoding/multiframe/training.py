@@ -232,6 +232,7 @@ def _train_epochs(
     seed: int,
     device: torch.device,
     batch_size_reference: int,
+    num_workers: int = 0,
 ) -> list[dict[str, Any]]:
     criterion = nn.CrossEntropyLoss()
     optimizer = _make_optimizer(model, config)
@@ -239,7 +240,13 @@ def _train_epochs(
     dataset = TensorDataset(train_tensor, torch.from_numpy(y_train_i))
     generator = torch.Generator()
     generator.manual_seed(int(seed))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+        num_workers=max(0, int(num_workers)),
+    )
     history: list[dict[str, Any]] = []
     for epoch in range(1, int(config.max_epochs) + 1):
         model.train()
@@ -276,8 +283,14 @@ def predict_probabilities(
     *,
     device: torch.device,
     batch_size: int,
+    num_workers: int = 0,
 ) -> np.ndarray:
-    loader = DataLoader(TensorDataset(tensor), batch_size=max(1, int(batch_size)), shuffle=False)
+    loader = DataLoader(
+        TensorDataset(tensor),
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+    )
     probs: list[np.ndarray] = []
     model.eval()
     with torch.no_grad():
