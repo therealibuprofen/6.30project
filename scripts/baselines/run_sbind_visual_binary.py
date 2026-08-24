@@ -250,9 +250,11 @@ def audit_session(args: argparse.Namespace, session: str) -> tuple[Any, list[tup
     ]
     historical = historical[common].copy()
     current = current[common].copy()
-    historical["session"] = historical["session"].astype(str)
-    current["session"] = current["session"].astype(str)
-    if not current.equals(historical):
+    # CSV parsing infers a one-cycle column such as test_cycles="0" as int,
+    # while the regenerated manifest deliberately keeps cycle lists as text.
+    # Compare canonical text values so dtype inference cannot cause a false
+    # mismatch; all fold-defining values and counts remain exact.
+    if not current.astype(str).equals(historical.astype(str)):
         raise AssertionError(f"session {session}: regenerated folds differ from formal clean4 manifest")
     for fold_i, (train_idx, test_idx) in enumerate(splits, start=1):
         overlap = set(data.groups[train_idx].tolist()) & set(data.groups[test_idx].tolist())
