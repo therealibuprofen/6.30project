@@ -1,0 +1,3 @@
+# Optional, dedicated CUDA server environment only. Do not install into the base project environment.
+# Suggested official package release; the model code imports Mamba (Mamba-1), not Mamba2/Mamba3.
+mamba-ssm==2.3.2.post1
