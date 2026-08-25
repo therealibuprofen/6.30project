@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -82,7 +83,7 @@ def test_real_clean4_shape_and_formal_fold_identity_when_data_present() -> None:
         / "session_710" / "split_manifest.csv"
     )
     if not data_path.exists() or not manifest_path.exists():
-        return
+        pytest.skip("real clean4 data or formal fold manifest unavailable")
     import pandas as pd
     from ultrasound_decoding.cv import grouped_cv_splits
     from ultrasound_decoding.multiframe.dataset import load_block_sequence_session, split_manifest

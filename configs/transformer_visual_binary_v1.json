@@ -1,0 +1,36 @@
+{
+  "experiment": "transformer_visual_binary_v1",
+  "model": "cnn_factorized_transformer",
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "task": "binary",
+  "input_shape": [4, 128, 501],
+  "seeds": [0, 1, 2],
+  "max_folds": 10,
+  "model_config": {
+    "stem_channels": [16, 32, 64],
+    "stem_kernel": 3,
+    "stem_stride": 2,
+    "stem_padding": 1,
+    "adaptive_pool": [8, 32],
+    "d_model": 64,
+    "num_heads": 4,
+    "spatial_layers": 2,
+    "temporal_layers": 1,
+    "dim_feedforward": 128,
+    "dropout": 0.25,
+    "activation": "gelu",
+    "pre_norm": true,
+    "causal_temporal_mask": false,
+    "n_classes": 2
+  },
+  "training": {
+    "optimizer": "AdamW",
+    "lr": 0.001,
+    "weight_decay": 0.001,
+    "batch_size": 16,
+    "max_epochs": 40,
+    "epoch_selection": "fixed_40_no_validation_or_test_selection"
+  },
+  "normalization": "arcsinh_then_train_pixel_zscore_train_fold_only",
+  "primary_metric": "OOF_balanced_accuracy"
+}
