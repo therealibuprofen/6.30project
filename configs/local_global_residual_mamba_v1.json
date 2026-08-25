@@ -1,7 +1,7 @@
 {
   "output_version": "local_global_residual_mamba_v1",
-  "implementation_version": "local_global_residual_mamba_v1.0.0",
-  "claim": "proposed-method first-round validation candidate",
+  "implementation_version": "local_global_residual_mamba_v1.1.0",
+  "claim": "proposed-method first-round validation with same-backbone mechanistic ablations",
   "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
   "strong_sessions": ["708", "709", "710"],
   "weak_sessions": ["626", "628", "807", "813", "817", "822"],
@@ -20,7 +20,35 @@
     "dropout": 0.25,
     "epoch_selection": "fixed 40; no validation/test selection"
   },
-  "architecture": {
+  "mechanistic_models": {
+    "same_stem_local_temporal1d": {
+      "fusion_mode": "local_only",
+      "representation": "F_local",
+      "effective_alpha": 0.0,
+      "alpha_is_trainable": false,
+      "uses_spatial_mamba": false,
+      "expected_formal_parameter_count": 48482
+    },
+    "same_stem_global_mamba_temporal1d": {
+      "fusion_mode": "global_only",
+      "representation": "F_global",
+      "effective_alpha": 1.0,
+      "alpha_is_trainable": false,
+      "uses_spatial_mamba": true,
+      "expected_formal_parameter_count": 116578
+    },
+    "local_global_residual_mamba": {
+      "fusion_mode": "gated_local_global",
+      "representation": "F_local + sigmoid(g) * (F_global - F_local)",
+      "gate_scope": "one global scalar",
+      "initial_gate_logit": -2.0,
+      "initial_alpha_approx": 0.11920292,
+      "alpha_is_trainable": true,
+      "uses_spatial_mamba": true,
+      "expected_formal_parameter_count": 116579
+    }
+  },
+  "shared_architecture": {
     "stem_channels": [16, 32, 64],
     "adaptive_pool": [8, 32],
     "local_feature_shape": "[B,4,64,8,32]",
@@ -31,17 +59,13 @@
     "d_state": 16,
     "d_conv": 4,
     "expand": 2,
-    "fusion": "F_local + sigmoid(g) * (F_global - F_local)",
-    "gate_scope": "one global scalar",
-    "initial_gate_logit": -2.0,
-    "initial_alpha_approx": 0.11920292,
-    "frame_feature": "spatial mean of fused 8x32 map -> [B,4,64]",
+    "frame_feature": "spatial mean of selected 8x32 map -> [B,4,64]",
     "temporal_head": "formal Temporal 1D-CNN topology and classifier",
-    "required_input_adaptation": "first Conv1d input channels 2048 -> 64",
+    "old_formal_temporal_input": "SmallCNNFrameEncoder.feature_dim=16*4*8=512; first Conv1d(512,64,kernel_size=3,padding=1)",
+    "required_input_adaptation": "first Conv1d input channels 512 -> 64",
     "temporal_hidden_channels": 64,
     "temporal_kernel_size": 3,
     "temporal_norm": "BatchNorm1d",
-    "expected_formal_parameter_count": 116579,
     "temporal_transformer": false,
     "multiscale": false
   },
@@ -51,15 +75,24 @@
     "factorized_transformer": "read formal summary; do not retrain",
     "fcnn_meanpool": "read formal clean4 results; do not retrain"
   },
-  "comparisons": [
+  "mechanistic_comparisons": [
+    "gated_vs_same_stem_local_only",
+    "gated_vs_same_stem_global_only",
+    "same_stem_global_only_vs_same_stem_local_only"
+  ],
+  "external_comparisons": [
     "proposed_vs_cnn2d_temporal1d",
     "proposed_vs_spatial_mamba",
     "proposed_vs_cnn_factorized_transformer",
     "proposed_vs_fcnn_meanpool"
   ],
   "success_rule": {
+    "gated_mean_BA_above_same_stem_local_only": true,
+    "gated_non_decreasing_sessions_vs_same_stem_local_at_least": 6,
+    "gated_mean_BA_not_below_same_stem_global_only": true,
+    "gated_non_decreasing_sessions_vs_same_stem_global_at_least": 6,
+    "strong_sessions_not_notably_down_vs_same_stem_local_at_least": 2,
     "mean_BA_above_temporal1d": true,
-    "non_decreasing_sessions_vs_temporal1d_at_least": 6,
     "strong_sessions_not_notably_down_at_least": 2,
     "notable_decline_tolerance_BA": 0.02,
     "strong_mean_recovery_vs_spatial_mamba_at_least_BA": 0.02,
@@ -73,6 +106,7 @@
     "full_stage_requires_flag": "--review-approved",
     "run_before_review_greenlight": false
   },
+  "formal_task_definition": "9 sessions x 3 same-backbone models x 3 seeds x formal folds",
   "frozen_server_environment": {
     "python": "3.10.4",
     "torch": "2.1.2+cu118",

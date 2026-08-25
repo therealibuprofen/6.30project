@@ -33,17 +33,20 @@ from ultrasound_decoding.multiframe.dataset import (
     cycle_text,
 )
 from ultrasound_decoding.multiframe.local_global_residual_mamba import (
-    EXPECTED_FORMAL_PARAMETER_COUNT,
+    EXPECTED_FORMAL_PARAMETER_COUNTS,
+    FUSION_MODE_BY_MODEL_NAME,
+    GLOBAL_ONLY_MODEL_NAME,
     INITIAL_GATE_LOGIT,
     LOCAL_BASELINE_NAME,
-    MODEL_DISPLAY_NAME,
+    LOCAL_ONLY_MODEL_NAME,
+    MODEL_DISPLAY_NAMES,
     MODEL_IMPLEMENTATION_VERSION,
     MODEL_NAME,
-    LocalGlobalResidualMambaClassifier,
+    LocalGlobalMambaTemporal1DClassifier,
     LocalGlobalResidualMambaConfig,
     architecture_config,
     parameter_breakdown,
-    train_local_global_residual_mamba_fold,
+    train_same_backbone_fusion_fold,
 )
 from ultrasound_decoding.multiframe.spatial_mamba import require_mamba_dependency
 from ultrasound_decoding.multiframe.training import DeepTrainingConfig, blocks_to_sequence_tensor
@@ -67,12 +70,17 @@ COMPARISON_BASELINES = (
     "cnn_factorized_transformer",
     "fcnn_meanpool",
 )
+MECHANISTIC_MODELS = (
+    LOCAL_ONLY_MODEL_NAME,
+    GLOBAL_ONLY_MODEL_NAME,
+    MODEL_NAME,
+)
 DISPLAY_NAMES = {
     LOCAL_BASELINE_NAME: "Temporal 1D-CNN",
     "spatial_mamba": "Spatial Mamba",
     "cnn_factorized_transformer": "CNN Factorized Transformer",
     "fcnn_meanpool": "FCNN mean-pool",
-    MODEL_NAME: MODEL_DISPLAY_NAME,
+    **MODEL_DISPLAY_NAMES,
 }
 REQUIRED_FINAL_OUTPUTS = (
     "proposed_summary.csv",
@@ -84,6 +92,8 @@ REQUIRED_FINAL_OUTPUTS = (
     "gate_summary.csv",
     "model_comparison.csv",
     "paired_comparisons.csv",
+    "mechanistic_paired_comparisons.csv",
+    "external_paired_comparisons.csv",
     "strong_session_comparison.csv",
     "overfitting_comparison.csv",
     "decision_rule_audit.json",
@@ -94,8 +104,8 @@ REQUIRED_FINAL_OUTPUTS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Frozen proposed v1 clean4 validation: local CNN + gated residual "
-            "Spatial Mamba + Temporal 1D-CNN."
+            "Frozen proposed v1.1 clean4 validation: three same-backbone local/global "
+            "fusion modes with a shared Temporal 1D-CNN."
         )
     )
     parser.add_argument("--stage", choices=("sanity", "full", "status"), required=True)
@@ -186,19 +196,30 @@ def frozen_experiment_config(batch_size: int) -> dict[str, Any]:
         "normalization": "arcsinh_then_train_pixel_zscore; outer train fold only",
         "oof_primary_metric": "balanced_accuracy",
         "seeds": list(SEEDS),
-        "models": ["local_temporal_baseline_reused", MODEL_NAME],
+        "mechanistic_models": list(MECHANISTIC_MODELS),
+        "external_baselines_reused": list(COMPARISON_BASELINES),
         "local_temporal_baseline_source": (
             "read existing formal cnn2d_temporal1d results; never retrain"
         ),
         "training": frozen_training_config(batch_size).__dict__,
-        "architecture": architecture_config(LocalGlobalResidualMambaConfig()),
+        "architectures": {
+            model_name: architecture_config(
+                LocalGlobalResidualMambaConfig(),
+                fusion_mode=FUSION_MODE_BY_MODEL_NAME[model_name],
+            )
+            for model_name in MECHANISTIC_MODELS
+        },
         "epoch_selection": "fixed 40 epochs; no validation/test model selection",
         "test_used_for_training_or_tuning": False,
         "oom_policy": "batch size fixed at 16; stop before formal tasks on OOM",
         "comparison_baselines": list(COMPARISON_BASELINES),
         "success_rule": {
+            "gated_mean_BA_above_same_stem_local_only": True,
+            "gated_non_decreasing_vs_same_stem_local_at_least": 6,
+            "gated_mean_BA_not_below_same_stem_global_only": True,
+            "gated_non_decreasing_vs_same_stem_global_at_least": 6,
+            "strong_at_least_2_of_3_delta_ge_minus_vs_same_stem_local": NOTABLE_DECLINE_TOLERANCE,
             "mean_BA_above_temporal1d": True,
-            "at_least_6_of_9_non_decreasing_vs_temporal1d": True,
             "strong_at_least_2_of_3_delta_ge_minus": NOTABLE_DECLINE_TOLERANCE,
             "strong_mean_recovery_vs_spatial_mamba_at_least": (
                 STRONG_MAMBA_RECOVERY_THRESHOLD
@@ -207,6 +228,7 @@ def frozen_experiment_config(batch_size: int) -> dict[str, Any]:
             "overfit_mitigation": (
                 "proposed severe-overfit session count is lower than pure Spatial Mamba"
             ),
+            "gate_interpretable_train_only_range": "mean final alpha strictly between 0.05 and 0.95",
             "failure_if": (
                 "mean not above Temporal1D OR all three strong sessions decline by >0.02 "
                 "OR severe-overfit session count is not lower than pure Spatial Mamba"
@@ -288,19 +310,21 @@ def audit_session(
     return audit_utils.audit_session(args, session)
 
 
-def task_dir(output_dir: Path, session: str, seed: int, fold: int) -> Path:
+def task_dir(
+    output_dir: Path, session: str, model: str, seed: int, fold: int
+) -> Path:
     return (
         output_dir
         / "tasks"
         / f"session_{session}"
-        / MODEL_NAME
+        / model
         / f"seed_{seed}"
         / f"fold_{fold:02d}"
     )
 
 
-def task_key(session: str, seed: int, fold: int) -> str:
-    return f"{session}:{MODEL_NAME}:{seed}:{fold}"
+def task_key(session: str, model: str, seed: int, fold: int) -> str:
+    return f"{session}:{model}:{seed}:{fold}"
 
 
 def task_fingerprint(run_fingerprint: str, row: dict[str, Any]) -> str:
@@ -340,21 +364,22 @@ def build_task_plan(args: argparse.Namespace, identity: dict[str, Any]) -> pd.Da
                 "cycle_overlap": False,
             }
         )
-        for seed in SEEDS:
-            for fold, (_, test_idx) in enumerate(splits, start=1):
-                row = {
-                    "session": session,
-                    "model": MODEL_NAME,
-                    "seed": seed,
-                    "fold": fold,
-                    "n_test_samples": len(test_idx),
-                    "task_key": task_key(session, seed, fold),
-                    "config_fingerprint": config_fp,
-                    "runtime_environment_fingerprint": runtime_fp,
-                    "batch_size": int(identity["experiment_config"]["training"]["batch_size"]),
-                }
-                row["task_fingerprint"] = task_fingerprint(run_fp, row)
-                rows.append(row)
+        for model in MECHANISTIC_MODELS:
+            for seed in SEEDS:
+                for fold, (_, test_idx) in enumerate(splits, start=1):
+                    row = {
+                        "session": session,
+                        "model": model,
+                        "seed": seed,
+                        "fold": fold,
+                        "n_test_samples": len(test_idx),
+                        "task_key": task_key(session, model, seed, fold),
+                        "config_fingerprint": config_fp,
+                        "runtime_environment_fingerprint": runtime_fp,
+                        "batch_size": int(identity["experiment_config"]["training"]["batch_size"]),
+                    }
+                    row["task_fingerprint"] = task_fingerprint(run_fp, row)
+                    rows.append(row)
         del data
     plan = pd.DataFrame(rows)
     atomic_csv(args.output_dir / "task_plan.csv", plan)
@@ -366,7 +391,7 @@ def build_task_plan(args: argparse.Namespace, identity: dict[str, Any]) -> pd.Da
             "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
             "runtime_environment_signature": identity["runtime_environment_signature"],
             "total_tasks": len(plan),
-            "task_definition": "session x proposed model x seed x fold",
+            "task_definition": "session x three same-backbone models x seed x fold",
             "existing_temporal_baseline_retrained": False,
             "created_utc": utc_now(),
         },
@@ -440,8 +465,12 @@ def validate_completed_task(
         return fail(f"unreadable artifact: {exc}")
 
     expected_task_fp = task_fingerprint(run_fingerprint, expected)
+    expected_model = str(expected["model"])
+    if expected_model not in MECHANISTIC_MODELS:
+        return fail("unexpected mechanistic model")
     expected_key = task_key(
-        str(expected["session"]), int(expected["seed"]), int(expected["fold"])
+        str(expected["session"]), expected_model,
+        int(expected["seed"]), int(expected["fold"])
     )
     if complete.get("task_key") != expected_key:
         return fail("COMPLETE task_key mismatch")
@@ -459,7 +488,7 @@ def validate_completed_task(
 
     expected_identity = (
         str(expected["session"]),
-        MODEL_NAME,
+        expected_model,
         int(expected["seed"]),
         int(expected["fold"]),
     )
@@ -490,7 +519,10 @@ def validate_completed_task(
     if result.get("model_implementation_version") != MODEL_IMPLEMENTATION_VERSION:
         return fail("result implementation version mismatch")
 
-    expected_architecture = architecture_config(LocalGlobalResidualMambaConfig())
+    expected_architecture = architecture_config(
+        LocalGlobalResidualMambaConfig(),
+        fusion_mode=FUSION_MODE_BY_MODEL_NAME[expected_model],
+    )
     observed_architecture = {
         key: value
         for key, value in model_config.items()
@@ -517,10 +549,11 @@ def validate_completed_task(
     for field in (*sorted(components), "total_parameter_count"):
         if int(result.get(field, -1)) != int(breakdown[field]):
             return fail(f"result parameter field mismatch: {field}")
-    if component_sum != EXPECTED_FORMAL_PARAMETER_COUNT:
+    if component_sum != EXPECTED_FORMAL_PARAMETER_COUNTS[expected_model]:
         return fail("formal parameter count differs from frozen architecture")
-    if int(breakdown.get("gate_parameters", -1)) != 1:
-        return fail("v1 must contain exactly one gate parameter")
+    expected_gate_parameters = 1 if expected_model == MODEL_NAME else 0
+    if int(breakdown.get("gate_parameters", -1)) != expected_gate_parameters:
+        return fail("gate parameter count differs from frozen fusion mode")
     if int(result.get("actual_batch_size", -1)) != int(expected["batch_size"]):
         return fail("actual batch size differs from frozen task config")
 
@@ -549,7 +582,7 @@ def validate_completed_task(
         return fail("prediction columns missing")
     if len(predictions) and not (
         predictions["session"].eq(str(expected["session"])).all()
-        and predictions["model"].eq(MODEL_NAME).all()
+        and predictions["model"].eq(expected_model).all()
         and pd.to_numeric(predictions["seed"]).eq(int(expected["seed"])).all()
         and pd.to_numeric(predictions["fold"]).eq(int(expected["fold"])).all()
     ):
@@ -583,7 +616,7 @@ def validate_completed_task(
         return fail("confusion matrix count mismatch")
     if not (
         confusion["session"].eq(str(expected["session"])).all()
-        and confusion["model"].eq(MODEL_NAME).all()
+        and confusion["model"].eq(expected_model).all()
         and pd.to_numeric(confusion["seed"]).eq(int(expected["seed"])).all()
         and pd.to_numeric(confusion["fold"]).eq(int(expected["fold"])).all()
     ):
@@ -607,13 +640,12 @@ def validate_completed_task(
         "epoch",
         "train_loss",
         "train_accuracy",
-        "alpha",
     }
     if not history_columns.issubset(history.columns) or len(history) != FORMAL_EPOCHS:
         return fail("training history missing columns or 40 epochs")
     if not (
         history["session"].eq(str(expected["session"])).all()
-        and history["model"].eq(MODEL_NAME).all()
+        and history["model"].eq(expected_model).all()
         and pd.to_numeric(history["seed"]).eq(int(expected["seed"])).all()
         and pd.to_numeric(history["fold"]).eq(int(expected["fold"])).all()
     ):
@@ -621,29 +653,50 @@ def validate_completed_task(
     expected_epochs = np.arange(1, FORMAL_EPOCHS + 1)
     if not np.array_equal(history["epoch"].to_numpy(int), expected_epochs):
         return fail("training epoch sequence invalid")
-    if not np.isfinite(
-        history[["train_loss", "train_accuracy", "alpha"]].to_numpy(float)
-    ).all():
+    if not np.isfinite(history[["train_loss", "train_accuracy"]].to_numpy(float)).all():
         return fail("training history contains non-finite values")
-    if not history["alpha"].between(0.0, 1.0, inclusive="neither").all():
-        return fail("alpha is outside (0,1)")
     if int(result.get("trained_epochs", -1)) != FORMAL_EPOCHS:
         return fail("result is not exactly 40 epochs")
 
-    initial_expected = float(torch.sigmoid(torch.tensor(INITIAL_GATE_LOGIT)).item())
-    for field in ("initial_alpha", "final_alpha", "mean_alpha_last5_epochs"):
-        if field not in gate or not np.isfinite(float(gate[field])):
-            return fail(f"gate audit missing {field}")
-    if not np.isclose(float(gate["initial_alpha"]), initial_expected, atol=1e-12):
-        return fail("initial alpha differs from sigmoid(-2)")
-    if not np.isclose(float(gate["final_alpha"]), float(history.iloc[-1]["alpha"]), atol=1e-12):
-        return fail("final alpha differs from final history row")
-    if not np.isclose(
-        float(gate["mean_alpha_last5_epochs"]),
-        float(history.tail(5)["alpha"].mean()),
-        atol=1e-12,
-    ):
-        return fail("mean last-5 alpha differs from history")
+    expected_fusion_mode = FUSION_MODE_BY_MODEL_NAME[expected_model]
+    if gate.get("fusion_mode") != expected_fusion_mode:
+        return fail("control audit fusion_mode mismatch")
+    if expected_model == MODEL_NAME:
+        if "alpha" not in history.columns:
+            return fail("gated history lacks alpha")
+        if not np.isfinite(history["alpha"].to_numpy(float)).all() or not history[
+            "alpha"
+        ].between(0.0, 1.0, inclusive="neither").all():
+            return fail("gated alpha history invalid")
+        if gate.get("alpha_is_trainable") is not True:
+            return fail("gated control is not marked trainable")
+        initial_expected = float(torch.sigmoid(torch.tensor(INITIAL_GATE_LOGIT)).item())
+        for field in ("initial_alpha", "final_alpha", "mean_alpha_last5_epochs"):
+            if field not in gate or not np.isfinite(float(gate[field])):
+                return fail(f"gate audit missing {field}")
+        if not np.isclose(float(gate["initial_alpha"]), initial_expected, atol=1e-12):
+            return fail("initial alpha differs from sigmoid(-2)")
+        if not np.isclose(
+            float(gate["final_alpha"]), float(history.iloc[-1]["alpha"]), atol=1e-12
+        ):
+            return fail("final alpha differs from final history row")
+        if not np.isclose(
+            float(gate["mean_alpha_last5_epochs"]),
+            float(history.tail(5)["alpha"].mean()),
+            atol=1e-12,
+        ):
+            return fail("mean last-5 alpha differs from history")
+    else:
+        expected_alpha = 0.0 if expected_model == LOCAL_ONLY_MODEL_NAME else 1.0
+        if "alpha" in history.columns:
+            return fail("fixed-control history must not contain alpha training curve")
+        if gate.get("alpha_is_trainable") is not False:
+            return fail("fixed control incorrectly marked trainable")
+        if not np.isclose(float(gate.get("effective_alpha", np.nan)), expected_alpha):
+            return fail("fixed effective_alpha mismatch")
+        forbidden = {"initial_alpha", "final_alpha", "mean_alpha_last5_epochs"}
+        if forbidden.intersection(gate):
+            return fail("fixed control contains fabricated learned-alpha fields")
     return True, "validated"
 
 
@@ -655,6 +708,7 @@ def update_status(
         path = task_dir(
             args.output_dir,
             str(expected["session"]),
+            str(expected["model"]),
             int(expected["seed"]),
             int(expected["fold"]),
         )
@@ -662,7 +716,7 @@ def update_status(
         rows.append(
             {
                 "session": str(expected["session"]),
-                "model": MODEL_NAME,
+                "model": str(expected["model"]),
                 "seed": int(expected["seed"]),
                 "fold": int(expected["fold"]),
                 "status": "complete" if valid else "pending",
@@ -680,7 +734,7 @@ def update_status(
     )
     for row in status[status["status"].eq("pending")].head(5).itertuples(index=False):
         print(
-            f"PENDING session={row.session} fold={row.fold} seed={row.seed} "
+            f"PENDING session={row.session} model={row.model} fold={row.fold} seed={row.seed} "
             f"reason={row.validation}",
             flush=True,
         )
@@ -704,61 +758,68 @@ def run_sanity(args: argparse.Namespace, identity: dict[str, Any]) -> None:
     tiny_train = select_balanced_indices(data.y, train_idx, per_class=2)
     tiny_test = select_balanced_indices(data.y, test_idx, per_class=1)
 
-    model = LocalGlobalResidualMambaClassifier().to(args.device)
     x = blocks_to_sequence_tensor(data.X[tiny_train[:2]]).to(args.device)
     y = torch.from_numpy(data.y[tiny_train[:2]].astype(np.int64)).to(args.device)
-    before_gate = model.gate_logit.detach().clone()
-    logits, shapes = model.forward_with_shapes(x)
-    loss = nn.CrossEntropyLoss()(logits, y)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    gradients_finite = all(
-        parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
-        for parameter in model.parameters()
-    )
-    optimizer.step()
-    expected_shapes = {
-        "input": (2, 4, 1, 128, 501),
-        "local_map": (2, 4, 64, 8, 32),
-        "global_map": (2, 4, 64, 8, 32),
-        "fused_map": (2, 4, 64, 8, 32),
-        "frame_features": (2, 4, 64),
-        "temporal_input": (2, 64, 4),
-        "temporal_features": (2, 64),
-        "logits": (2, 2),
-    }
-    if shapes != expected_shapes:
-        raise AssertionError(f"unexpected sanity shapes: {shapes}")
-    if not bool(torch.isfinite(loss).item()) or not gradients_finite:
-        raise AssertionError("sanity forward/backward produced non-finite values")
-    if torch.equal(before_gate, model.gate_logit.detach()):
-        raise AssertionError("global gate did not receive an optimizer update")
+    sanity_models: list[dict[str, Any]] = []
+    for model_name in MECHANISTIC_MODELS:
+        fusion_mode = FUSION_MODE_BY_MODEL_NAME[model_name]
+        model = LocalGlobalMambaTemporal1DClassifier(fusion_mode).to(args.device)
+        gate_before = (
+            model.gate_logit.detach().clone() if model.alpha_is_trainable else None
+        )
+        logits, shapes = model.forward_with_shapes(x)
+        loss = nn.CrossEntropyLoss()(logits, y)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        gradients_finite = all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        )
+        optimizer.step()
+        if tuple(logits.shape) != (2, 2) or not bool(torch.isfinite(loss).item()):
+            raise AssertionError(f"{model_name}: invalid sanity logits/loss")
+        if not gradients_finite:
+            raise AssertionError(f"{model_name}: non-finite sanity gradients")
+        if gate_before is not None and torch.equal(gate_before, model.gate_logit.detach()):
+            raise AssertionError("gated model gate did not receive an optimizer update")
 
-    result, gate = train_local_global_residual_mamba_fold(
-        data.X[tiny_train],
-        data.y[tiny_train],
-        data.X[tiny_test],
-        np.asarray([0, 1], dtype=np.int64),
-        session="710",
-        fold=1,
-        seed=0,
-        train_cycles=cycle_text(data.groups[tiny_train]),
-        test_cycles=cycle_text(data.groups[tiny_test]),
-        training_config=frozen_training_config(
-            min(4, len(tiny_train)), epochs=args.sanity_epochs
-        ),
-        device=args.device,
-        workers=0,
-    )
-    if len(result.history) != args.sanity_epochs:
-        raise AssertionError("tiny sanity fit epoch count mismatch")
-    if not np.isfinite(result.probabilities).all() or not np.allclose(
-        result.probabilities.sum(axis=1), 1.0, atol=1e-5
-    ):
-        raise AssertionError("sanity probabilities invalid")
-    if bool(result.normalization_audit["target_used_for_stats"]):
-        raise AssertionError("sanity normalization used test data")
+        result, control = train_same_backbone_fusion_fold(
+            data.X[tiny_train],
+            data.y[tiny_train],
+            data.X[tiny_test],
+            np.asarray([0, 1], dtype=np.int64),
+            session="710",
+            fold=1,
+            seed=0,
+            train_cycles=cycle_text(data.groups[tiny_train]),
+            test_cycles=cycle_text(data.groups[tiny_test]),
+            training_config=frozen_training_config(
+                min(4, len(tiny_train)), epochs=args.sanity_epochs
+            ),
+            model_name=model_name,
+            device=args.device,
+            workers=0,
+        )
+        if len(result.history) != args.sanity_epochs:
+            raise AssertionError(f"{model_name}: tiny sanity epoch count mismatch")
+        if not np.isfinite(result.probabilities).all() or not np.allclose(
+            result.probabilities.sum(axis=1), 1.0, atol=1e-5
+        ):
+            raise AssertionError(f"{model_name}: sanity probabilities invalid")
+        if bool(result.normalization_audit["target_used_for_stats"]):
+            raise AssertionError(f"{model_name}: sanity normalization used test data")
+        sanity_models.append(
+            {
+                "model": model_name,
+                "fusion_mode": fusion_mode,
+                "shapes": {key: list(value) for key, value in shapes.items()},
+                "control_audit": control,
+                "loss_finite": True,
+                "backward_success": True,
+            }
+        )
+        del result, optimizer, loss, logits, model
     sanity_dir = args.output_dir / "sanity"
     atomic_json(
         sanity_dir / "sanity_audit.json",
@@ -766,13 +827,9 @@ def run_sanity(args: argparse.Namespace, identity: dict[str, Any]) -> None:
             "session": "710",
             "fold": 1,
             "seed": 0,
-            "shapes": {key: list(value) for key, value in shapes.items()},
-            "initial_alpha": gate["initial_alpha"],
-            "final_alpha": gate["final_alpha"],
+            "models": sanity_models,
             "formal_clean4_fold_match": True,
             "cycle_overlap": False,
-            "loss_finite": True,
-            "backward_success": True,
             "normalization_target_used_for_stats": False,
             "tiny_epochs": args.sanity_epochs,
             "debug_only_not_formal": True,
@@ -800,12 +857,13 @@ def write_fold_task(
 ) -> None:
     run_fp = fingerprint(identity)
     session = str(expected["session"])
+    model_name = str(expected["model"])
     seed = int(expected["seed"])
     fold = int(expected["fold"])
-    path = task_dir(args.output_dir, session, seed, fold)
+    path = task_dir(args.output_dir, session, model_name, seed, fold)
     train_cycles = cycle_text(data.groups[train_idx])
     test_cycles = cycle_text(data.groups[test_idx])
-    trained, gate_audit = train_local_global_residual_mamba_fold(
+    trained, gate_audit = train_same_backbone_fusion_fold(
         data.X[train_idx],
         data.y[train_idx],
         data.X[test_idx],
@@ -818,6 +876,7 @@ def write_fold_task(
         training_config=DeepTrainingConfig(
             **identity["experiment_config"]["training"]
         ),
+        model_name=model_name,
         architecture=LocalGlobalResidualMambaConfig(),
         device=args.device,
         workers=args.workers,
@@ -829,7 +888,7 @@ def write_fold_task(
         prediction_rows.append(
             {
                 "session": session,
-                "model": MODEL_NAME,
+                "model": model_name,
                 "seed": seed,
                 "fold": fold,
                 "sample_index": int(sample_index),
@@ -848,7 +907,7 @@ def write_fold_task(
     confusion_rows = [
         {
             "session": session,
-            "model": MODEL_NAME,
+            "model": model_name,
             "seed": seed,
             "fold": fold,
             "true_label": true_label,
@@ -862,7 +921,7 @@ def write_fold_task(
     history = pd.DataFrame(trained.history)
     history.insert(0, "fold", fold)
     history.insert(0, "seed", seed)
-    history.insert(0, "model", MODEL_NAME)
+    history.insert(0, "model", model_name)
     history.insert(0, "session", session)
     task_fp = task_fingerprint(run_fp, expected)
     breakdown = trained.model_config["parameter_breakdown"]
@@ -876,7 +935,7 @@ def write_fold_task(
         "runtime_environment_signature": identity["runtime_environment_signature"],
         "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
         "session": session,
-        "model": MODEL_NAME,
+        "model": model_name,
         "seed": seed,
         "fold": fold,
         "n_cycles": data.n_cycles,
@@ -890,19 +949,28 @@ def write_fold_task(
         "macro_f1": float(metrics["macro_f1"]),
         "parameter_count": int(trained.model_parameters),
         **{key: int(value) for key, value in breakdown.items()},
-        **{key: float(value) for key, value in gate_audit.items()},
+        "fusion_mode": str(gate_audit["fusion_mode"]),
+        "alpha_is_trainable": bool(gate_audit["alpha_is_trainable"]),
+        "effective_alpha": float(gate_audit["effective_alpha"]),
         "actual_batch_size": int(identity["experiment_config"]["training"]["batch_size"]),
         "final_training_loss": float(trained.final_training_loss),
         "trained_epochs": int(trained.final_trained_epochs),
         "device": trained.device,
     }
+    for field in ("initial_alpha", "final_alpha", "mean_alpha_last5_epochs"):
+        if field in gate_audit:
+            result_payload[field] = float(gate_audit[field])
     gate_payload = {
         "session": session,
-        "model": MODEL_NAME,
+        "model": model_name,
         "seed": seed,
         "fold": fold,
-        **{key: float(value) for key, value in gate_audit.items()},
-        "gate_scope": "one global trainable scalar",
+        **gate_audit,
+        "gate_scope": (
+            "one global trainable scalar"
+            if bool(gate_audit["alpha_is_trainable"])
+            else "fixed mechanistic control; no trainable gate"
+        ),
         "test_fold_used_to_set_gate": False,
     }
     atomic_json(path / "result.json", result_payload)
@@ -915,7 +983,7 @@ def write_fold_task(
     atomic_json(
         path / "COMPLETE.json",
         {
-            "task_key": task_key(session, seed, fold),
+            "task_key": task_key(session, model_name, seed, fold),
             "run_fingerprint": run_fp,
             "task_fingerprint": task_fp,
             "config_fingerprint": str(expected["config_fingerprint"]),
@@ -949,6 +1017,7 @@ def read_all_validated_tasks(
         path = task_dir(
             args.output_dir,
             str(expected["session"]),
+            str(expected["model"]),
             int(expected["seed"]),
             int(expected["fold"]),
         )
@@ -1076,14 +1145,18 @@ def load_existing_comparison_baselines(args: argparse.Namespace) -> pd.DataFrame
     return combined.sort_values(["session", "model"]).reset_index(drop=True)
 
 
-def paired_comparison_rows(comparison: pd.DataFrame) -> pd.DataFrame:
+def pairwise_comparison_rows(
+    comparison: pd.DataFrame,
+    pairs: tuple[tuple[str, str], ...],
+    comparison_type: str,
+) -> pd.DataFrame:
     pivot = comparison.pivot(index="session", columns="model", values="mean_BA")
     rows: list[dict[str, Any]] = []
-    for baseline in COMPARISON_BASELINES:
-        if baseline not in pivot or MODEL_NAME not in pivot:
-            raise AssertionError(f"comparison is incomplete for {baseline}")
+    for candidate, baseline in pairs:
+        if baseline not in pivot or candidate not in pivot:
+            raise AssertionError(f"comparison is incomplete for {candidate} vs {baseline}")
         deltas = (
-            pivot.loc[list(EXPECTED_SESSIONS), MODEL_NAME]
+            pivot.loc[list(EXPECTED_SESSIONS), candidate]
             - pivot.loc[list(EXPECTED_SESSIONS), baseline]
         )
         strong_delta = deltas.loc[list(STRONG_SESSIONS)]
@@ -1091,7 +1164,9 @@ def paired_comparison_rows(comparison: pd.DataFrame) -> pd.DataFrame:
         tolerance = 1e-12
         rows.append(
             {
-                "comparison": f"{MODEL_NAME}_vs_{baseline}",
+                "comparison_type": comparison_type,
+                "comparison": f"{candidate}_vs_{baseline}",
+                "candidate": candidate,
                 "baseline": baseline,
                 "n_sessions": len(deltas),
                 "mean_delta_BA": float(deltas.mean()),
@@ -1126,11 +1201,33 @@ def paired_comparison_rows(comparison: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def mechanistic_comparison_rows(comparison: pd.DataFrame) -> pd.DataFrame:
+    return pairwise_comparison_rows(
+        comparison,
+        (
+            (MODEL_NAME, LOCAL_ONLY_MODEL_NAME),
+            (MODEL_NAME, GLOBAL_ONLY_MODEL_NAME),
+            (GLOBAL_ONLY_MODEL_NAME, LOCAL_ONLY_MODEL_NAME),
+        ),
+        "mechanistic_same_backbone",
+    )
+
+
+def paired_comparison_rows(comparison: pd.DataFrame) -> pd.DataFrame:
+    return pairwise_comparison_rows(
+        comparison,
+        tuple((MODEL_NAME, baseline) for baseline in COMPARISON_BASELINES),
+        "external_baseline",
+    )
+
+
 def build_proposed_overfit(
     history: pd.DataFrame, per_seed: pd.DataFrame
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for (session, seed), group in history.groupby(["session", "seed"], sort=True):
+    for (session, model, seed), group in history.groupby(
+        ["session", "model", "seed"], sort=True
+    ):
         by_epoch = (
             group.groupby("epoch", as_index=True)["train_accuracy"].mean().sort_index()
         )
@@ -1138,6 +1235,7 @@ def build_proposed_overfit(
             raise AssertionError(f"history incomplete for {session} seed {seed}")
         oof = per_seed[
             per_seed["session"].astype(str).eq(str(session))
+            & per_seed["model"].astype(str).eq(str(model))
             & per_seed["seed"].astype(int).eq(int(seed))
         ]
         if len(oof) != 1:
@@ -1148,7 +1246,7 @@ def build_proposed_overfit(
         rows.append(
             {
                 "session": str(session),
-                "model": MODEL_NAME,
+                "model": str(model),
                 "seed": int(seed),
                 "final_train_accuracy": float(by_epoch.loc[FORMAL_EPOCHS]),
                 "best_train_accuracy": best_train,
@@ -1209,12 +1307,20 @@ def decision_rule_audit(
     comparison: pd.DataFrame,
     paired: pd.DataFrame,
     overfitting: pd.DataFrame,
+    gates: pd.DataFrame,
 ) -> dict[str, Any]:
     pivot = comparison.pivot(index="session", columns="model", values="mean_BA")
     temporal_delta = pivot[MODEL_NAME] - pivot[LOCAL_BASELINE_NAME]
     mamba_delta = pivot[MODEL_NAME] - pivot["spatial_mamba"]
     strong_temporal = temporal_delta.loc[list(STRONG_SESSIONS)]
     strong_mamba = mamba_delta.loc[list(STRONG_SESSIONS)]
+    local_delta = pivot[MODEL_NAME] - pivot[LOCAL_ONLY_MODEL_NAME]
+    global_delta = pivot[MODEL_NAME] - pivot[GLOBAL_ONLY_MODEL_NAME]
+    strong_local = local_delta.loc[list(STRONG_SESSIONS)]
+    gated_rows = gates[gates["model"].astype(str).eq(MODEL_NAME)]
+    if len(gated_rows) == 0 or "final_alpha" not in gated_rows:
+        raise AssertionError("gated control audit is missing final alpha")
+    mean_final_alpha = float(gated_rows["final_alpha"].astype(float).mean())
     severe_flags = overfitting["possible_severe_overfit"].map(
         lambda value: value
         if isinstance(value, (bool, np.bool_))
@@ -1228,10 +1334,20 @@ def decision_rule_audit(
     proposed_severe = int(severe_by_model.loc[MODEL_NAME].sum())
     mamba_severe = int(severe_by_model.loc["spatial_mamba"].sum())
     checks = {
-        "mean_BA_above_temporal1d": bool(temporal_delta.mean() > 0.0),
-        "at_least_6_of_9_non_decreasing_vs_temporal1d": bool(
-            int((temporal_delta >= -1e-12).sum()) >= 6
+        "gated_mean_BA_above_same_stem_local_only": bool(local_delta.mean() > 0.0),
+        "gated_at_least_6_of_9_non_decreasing_vs_same_stem_local": bool(
+            int((local_delta >= -1e-12).sum()) >= 6
         ),
+        "gated_mean_BA_not_below_same_stem_global_only": bool(
+            global_delta.mean() >= -1e-12
+        ),
+        "gated_at_least_6_of_9_non_decreasing_vs_same_stem_global": bool(
+            int((global_delta >= -1e-12).sum()) >= 6
+        ),
+        "strong_at_least_2_of_3_not_notably_down_vs_same_stem_local": bool(
+            int((strong_local >= -NOTABLE_DECLINE_TOLERANCE).sum()) >= 2
+        ),
+        "mean_BA_above_temporal1d": bool(temporal_delta.mean() > 0.0),
         "strong_at_least_2_of_3_not_notably_down_vs_temporal1d": bool(
             int((strong_temporal >= -NOTABLE_DECLINE_TOLERANCE).sum()) >= 2
         ),
@@ -1244,6 +1360,9 @@ def decision_rule_audit(
         "severe_overfit_session_count_reduced_vs_spatial_mamba": bool(
             proposed_severe < mamba_severe
         ),
+        "mean_final_alpha_in_predefined_interpretable_range": bool(
+            0.05 < mean_final_alpha < 0.95
+        ),
     }
     supports_continue = bool(all(checks.values()))
     return {
@@ -1253,6 +1372,7 @@ def decision_rule_audit(
         "checks": checks,
         "proposed_severe_overfit_sessions": proposed_severe,
         "spatial_mamba_severe_overfit_sessions": mamba_severe,
+        "mean_final_alpha": mean_final_alpha,
         "decision": (
             "supports_continue_mamba_route_to_manually_reviewed_multiscale_stage"
             if supports_continue
@@ -1260,7 +1380,7 @@ def decision_rule_audit(
         ),
         "automatic_next_stage_started": False,
         "paired_table_fingerprint": fingerprint(
-            paired.sort_values("baseline").to_dict(orient="records")
+            paired.sort_values(["comparison_type", "comparison"]).to_dict(orient="records")
         ),
     }
 
@@ -1273,9 +1393,13 @@ def build_report(
     decision: dict[str, Any],
 ) -> str:
     pivot = comparison.pivot(index="session", columns="model", values="mean_BA")
-    gate_tagged = gates.assign(
+    gate_tagged = gates[gates["model"].astype(str).eq(MODEL_NAME)].assign(
         session_group=np.where(
-            gates["session"].astype(str).isin(STRONG_SESSIONS), "strong", "weak"
+            gates[gates["model"].astype(str).eq(MODEL_NAME)]["session"]
+            .astype(str)
+            .isin(STRONG_SESSIONS),
+            "strong",
+            "weak",
         )
     )
     gate_group = gate_tagged.groupby("session_group")["final_alpha"].mean()
@@ -1286,10 +1410,22 @@ def build_report(
         "",
         "本报告执行预先冻结的第一轮评价；没有根据测试结果修改 gate、Mamba、TCN 或训练参数。",
         "",
-        "## Nine-session comparisons",
+        "## Mechanistic ablations",
         "",
     ]
-    for row in paired.itertuples(index=False):
+    mechanistic = paired[paired["comparison_type"].eq("mechanistic_same_backbone")]
+    external = paired[paired["comparison_type"].eq("external_baseline")]
+    for row in mechanistic.itertuples(index=False):
+        lines.append(
+            f"- {DISPLAY_NAMES[row.candidate]} vs {DISPLAY_NAMES[row.baseline]}: mean ΔBA="
+            f"{row.mean_delta_BA:+.4f}, median={row.median_delta_BA:+.4f}, "
+            f"improved/tied/worsened={row.improved_sessions}/{row.tied_sessions}/"
+            f"{row.worsened_sessions}, exact p={row.exact_two_sided_sign_flip_p:.4f}, "
+            f"strong Δ={row.strong_session_mean_delta_BA:+.4f}, "
+            f"weak Δ={row.weak_session_mean_delta_BA:+.4f}."
+        )
+    lines.extend(["", "## External baselines", ""])
+    for row in external.itertuples(index=False):
         lines.append(
             f"- Proposed vs {DISPLAY_NAMES[row.baseline]}: mean ΔBA="
             f"{row.mean_delta_BA:+.4f}, median={row.median_delta_BA:+.4f}, "
@@ -1303,6 +1439,8 @@ def build_report(
         lines.append(
             f"- {session}: Temporal1D={pivot.loc[session, LOCAL_BASELINE_NAME]:.4f}, "
             f"Spatial Mamba={pivot.loc[session, 'spatial_mamba']:.4f}, "
+            f"same-stem local={pivot.loc[session, LOCAL_ONLY_MODEL_NAME]:.4f}, "
+            f"same-stem global={pivot.loc[session, GLOBAL_ONLY_MODEL_NAME]:.4f}, "
             f"Proposed={pivot.loc[session, MODEL_NAME]:.4f}."
         )
     lines.extend(
@@ -1334,17 +1472,21 @@ def aggregate_outputs(
     per_fold, predictions, confusions, history, gates = read_all_validated_tasks(
         args, plan, run_fp
     )
-    per_fold = per_fold.sort_values(["session", "seed", "fold"]).reset_index(drop=True)
+    per_fold = per_fold.sort_values(
+        ["session", "model", "seed", "fold"]
+    ).reset_index(drop=True)
     predictions = predictions.sort_values(
-        ["session", "seed", "fold", "sample_index"]
+        ["session", "model", "seed", "fold", "sample_index"]
     ).reset_index(drop=True)
     confusions = confusions.sort_values(
-        ["session", "seed", "fold", "true_label", "predicted_label"]
+        ["session", "model", "seed", "fold", "true_label", "predicted_label"]
     ).reset_index(drop=True)
-    history = history.sort_values(["session", "seed", "fold", "epoch"]).reset_index(
-        drop=True
-    )
-    gates = gates.sort_values(["session", "seed", "fold"]).reset_index(drop=True)
+    history = history.sort_values(
+        ["session", "model", "seed", "fold", "epoch"]
+    ).reset_index(drop=True)
+    gates = gates.sort_values(
+        ["session", "model", "seed", "fold"]
+    ).reset_index(drop=True)
     atomic_csv(args.output_dir / "proposed_per_fold.csv", per_fold)
     atomic_csv(args.output_dir / "proposed_predictions.csv", predictions)
     atomic_csv(args.output_dir / "proposed_confusion_matrices.csv", confusions)
@@ -1357,6 +1499,7 @@ def aggregate_outputs(
     ):
         source = per_fold[
             per_fold["session"].astype(str).eq(str(session))
+            & per_fold["model"].astype(str).eq(str(model))
             & per_fold["seed"].astype(int).eq(int(seed))
         ]
         if group["sample_index"].duplicated().any():
@@ -1383,8 +1526,8 @@ def aggregate_outputs(
                 "parameter_count": int(source["parameter_count"].iloc[0]),
             }
         )
-    per_seed = pd.DataFrame(seed_rows).sort_values(["session", "seed"])
-    if len(per_seed) != len(EXPECTED_SESSIONS) * len(SEEDS):
+    per_seed = pd.DataFrame(seed_rows).sort_values(["session", "model", "seed"])
+    if len(per_seed) != len(EXPECTED_SESSIONS) * len(MECHANISTIC_MODELS) * len(SEEDS):
         raise AssertionError("proposed OOF per-seed coverage is incomplete")
     atomic_csv(args.output_dir / "proposed_per_seed.csv", per_seed)
     summary = (
@@ -1403,7 +1546,7 @@ def aggregate_outputs(
 
     existing = load_existing_comparison_baselines(args)
     proposed_rows = summary.assign(
-        model_display=MODEL_DISPLAY_NAME,
+        model_display=summary["model"].map(DISPLAY_NAMES),
         n_seeds=len(SEEDS),
         source=str(args.output_dir / "proposed_summary.csv"),
         retrained_by_this_runner=True,
@@ -1411,17 +1554,29 @@ def aggregate_outputs(
     comparison = pd.concat([existing, proposed_rows], ignore_index=True).sort_values(
         ["session", "model"]
     )
-    if len(comparison) != len(EXPECTED_SESSIONS) * (len(COMPARISON_BASELINES) + 1):
+    if len(comparison) != len(EXPECTED_SESSIONS) * (
+        len(COMPARISON_BASELINES) + len(MECHANISTIC_MODELS)
+    ):
         raise AssertionError("model comparison row count is incomplete")
     atomic_csv(args.output_dir / "model_comparison.csv", comparison)
-    paired = paired_comparison_rows(comparison)
+    mechanistic_paired = mechanistic_comparison_rows(comparison)
+    external_paired = paired_comparison_rows(comparison)
+    paired = pd.concat(
+        [mechanistic_paired, external_paired], ignore_index=True
+    ).sort_values(["comparison_type", "comparison"])
     atomic_csv(args.output_dir / "paired_comparisons.csv", paired)
+    atomic_csv(
+        args.output_dir / "mechanistic_paired_comparisons.csv", mechanistic_paired
+    )
+    atomic_csv(args.output_dir / "external_paired_comparisons.csv", external_paired)
 
     strong = comparison[
         comparison["session"].isin(STRONG_SESSIONS)
-        & comparison["model"].isin([LOCAL_BASELINE_NAME, "spatial_mamba", MODEL_NAME])
+        & comparison["model"].isin(
+            [*MECHANISTIC_MODELS, LOCAL_BASELINE_NAME, "spatial_mamba"]
+        )
     ][["session", "model", "model_display", "mean_BA", "std_BA"]]
-    if len(strong) != len(STRONG_SESSIONS) * 3:
+    if len(strong) != len(STRONG_SESSIONS) * 5:
         raise AssertionError("strong-session comparison is incomplete")
     atomic_csv(args.output_dir / "strong_session_comparison.csv", strong)
 
@@ -1431,7 +1586,7 @@ def aggregate_outputs(
         ["session", "model", "seed"]
     )
     atomic_csv(args.output_dir / "overfitting_comparison.csv", overfitting)
-    decision = decision_rule_audit(comparison, paired, overfitting)
+    decision = decision_rule_audit(comparison, paired, overfitting, gates)
     atomic_json(args.output_dir / "decision_rule_audit.json", decision)
     atomic_text(
         args.output_dir / "proposed_v1_report.md",
@@ -1445,38 +1600,62 @@ def run_cuda_batch16_preflight(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device if args.device != "auto" else "cuda")
     audit: dict[str, Any] = {}
     try:
-        torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
-        model = LocalGlobalResidualMambaClassifier().to(device)
-        inputs = torch.zeros((16, 4, 1, 128, 501), dtype=torch.float32, device=device)
-        targets = torch.arange(16, device=device, dtype=torch.long) % 2
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
-        initial_alpha = float(model.alpha.detach().cpu().item())
-        logits = model(inputs)
-        loss = nn.CrossEntropyLoss()(logits, targets)
-        loss.backward()
-        optimizer.step()
-        if tuple(logits.shape) != (16, 2) or not bool(torch.isfinite(loss).item()):
-            raise AssertionError("CUDA batch-16 preflight produced invalid output")
+        model_audits: list[dict[str, Any]] = []
+        for model_name in MECHANISTIC_MODELS:
+            torch.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
+            fusion_mode = FUSION_MODE_BY_MODEL_NAME[model_name]
+            model = LocalGlobalMambaTemporal1DClassifier(fusion_mode).to(device)
+            inputs = torch.zeros(
+                (16, 4, 1, 128, 501), dtype=torch.float32, device=device
+            )
+            targets = torch.arange(16, device=device, dtype=torch.long) % 2
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=1e-3, weight_decay=1e-3
+            )
+            initial_effective_alpha = float(
+                model.effective_alpha.detach().cpu().item()
+            )
+            logits = model(inputs)
+            loss = nn.CrossEntropyLoss()(logits, targets)
+            loss.backward()
+            optimizer.step()
+            if tuple(logits.shape) != (16, 2) or not bool(torch.isfinite(loss).item()):
+                raise AssertionError(
+                    f"{model_name}: CUDA batch-16 preflight produced invalid output"
+                )
+            breakdown = parameter_breakdown(model)
+            if breakdown["total_parameter_count"] != EXPECTED_FORMAL_PARAMETER_COUNTS[
+                model_name
+            ]:
+                raise AssertionError(
+                    f"{model_name}: formal parameter count differs from frozen architecture"
+                )
+            model_audits.append(
+                {
+                    "model": model_name,
+                    "fusion_mode": fusion_mode,
+                    "alpha_is_trainable": model.alpha_is_trainable,
+                    "initial_effective_alpha": initial_effective_alpha,
+                    "post_step_effective_alpha": float(
+                        model.effective_alpha.detach().cpu().item()
+                    ),
+                    "logits_shape": [16, 2],
+                    "loss_finite": True,
+                    "backward_success": True,
+                    "optimizer_step_success": True,
+                    **breakdown,
+                }
+            )
+            del loss, logits, optimizer, targets, inputs, model
         audit = {
             "status": "pass",
             "formal_training_started": False,
             "device": str(device),
             "batch_size": 16,
             "input_shape": [16, 4, 1, 128, 501],
-            "logits_shape": [16, 2],
-            "loss_finite": True,
-            "backward_success": True,
-            "optimizer_step_success": True,
-            "initial_alpha": initial_alpha,
-            "post_step_alpha": float(model.alpha.detach().cpu().item()),
-            **parameter_breakdown(model),
+            "models": model_audits,
         }
-        if audit["total_parameter_count"] != EXPECTED_FORMAL_PARAMETER_COUNT:
-            raise AssertionError(
-                "formal parameter count differs from frozen proposed v1 architecture"
-            )
-        del loss, logits, optimizer, targets, inputs, model
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower():
             raise RuntimeError(
@@ -1489,8 +1668,7 @@ def run_cuda_batch16_preflight(args: argparse.Namespace) -> dict[str, Any]:
             torch.cuda.empty_cache()
     atomic_json(args.output_dir / "audit" / "cuda_batch16_preflight.json", audit)
     print(
-        f"PREFLIGHT PASS batch_size=16 parameters={audit['total_parameter_count']} "
-        f"device={device}",
+        f"PREFLIGHT PASS batch_size=16 models={len(audit['models'])} device={device}",
         flush=True,
     )
     return audit
@@ -1533,30 +1711,32 @@ def run_full(args: argparse.Namespace, identity: dict[str, Any]) -> None:
             continue
         data, splits = audit_session(args, session)
         for expected in session_plan.to_dict(orient="records"):
+            model_name = str(expected["model"])
             path = task_dir(
                 args.output_dir,
                 session,
+                model_name,
                 int(expected["seed"]),
                 int(expected["fold"]),
             )
             valid, _ = validate_completed_task(path, expected, run_fp)
             if valid:
                 print(
-                    f"SKIP [{completed}/{total}] session={session} model={MODEL_NAME} "
+                    f"SKIP [{completed}/{total}] session={session} model={model_name} "
                     f"fold={expected['fold']} seed={expected['seed']} device={args.device}",
                     flush=True,
                 )
                 continue
             train_idx, test_idx = splits[int(expected["fold"]) - 1]
             print(
-                f"RUN  [{completed}/{total}] session={session} model={MODEL_NAME} "
+                f"RUN  [{completed}/{total}] session={session} model={model_name} "
                 f"fold={expected['fold']} seed={expected['seed']} device={args.device}",
                 flush=True,
             )
             write_fold_task(args, identity, expected, data, train_idx, test_idx)
             completed += 1
             print(
-                f"DONE [{completed}/{total}] session={session} model={MODEL_NAME} "
+                f"DONE [{completed}/{total}] session={session} model={model_name} "
                 f"fold={expected['fold']} seed={expected['seed']} device={args.device}",
                 flush=True,
             )
@@ -1582,6 +1762,8 @@ def run_full(args: argparse.Namespace, identity: dict[str, Any]) -> None:
             "runtime_environment_signature": identity["runtime_environment_signature"],
             "completed_tasks": len(plan),
             "total_tasks": len(plan),
+            "mechanistic_models_trained": list(MECHANISTIC_MODELS),
+            "external_baselines_reused_read_only": list(COMPARISON_BASELINES),
             "existing_temporal_baseline_retrained": False,
             "required_outputs": list(REQUIRED_FINAL_OUTPUTS),
             "strict_task_revalidation_before_aggregation": True,
