@@ -1067,19 +1067,114 @@ def _first_existing(paths: list[Path], description: str) -> Path:
     return selected
 
 
+def load_clean4_formal_seed_records(args: argparse.Namespace) -> pd.DataFrame:
+    """Merge all formal clean4 candidates at session/method/seed granularity.
+
+    Candidate order is the frozen source priority. Duplicate keys are accepted
+    only when BA and accuracy agree; lower-priority sources can fill missing
+    sessions but can never silently override a conflicting formal result.
+    """
+    selected_methods = (LOCAL_BASELINE_NAME, "fcnn_meanpool")
+    records: list[dict[str, Any]] = []
+    checked_sources: list[str] = []
+    for source_priority, path in enumerate(clean4_long_candidates(args)):
+        if not path.exists():
+            continue
+        frame = pd.read_csv(path, dtype={"session": str})
+        required = {"session", "method", "seed", "balanced_accuracy", "accuracy"}
+        if not required.issubset(frame.columns):
+            checked_sources.append(f"{path} (ignored: missing {sorted(required - set(frame.columns))})")
+            continue
+        if "task" in frame.columns:
+            frame = frame[frame["task"].astype(str).eq(TASK_NAME)]
+        frame = frame[
+            frame["session"].astype(str).isin(EXPECTED_SESSIONS)
+            & frame["method"].astype(str).isin(selected_methods)
+        ].copy()
+        frame["seed"] = pd.to_numeric(frame["seed"], errors="raise").astype(int)
+        frame = frame[frame["seed"].isin(SEEDS)]
+        checked_sources.append(str(path))
+        for row in frame.itertuples(index=False):
+            balanced_accuracy = float(row.balanced_accuracy)
+            accuracy = float(row.accuracy)
+            if not np.isfinite([balanced_accuracy, accuracy]).all():
+                raise AssertionError(f"non-finite formal baseline metric in {path}")
+            records.append(
+                {
+                    "session": str(row.session),
+                    "method": str(row.method),
+                    "seed": int(row.seed),
+                    "balanced_accuracy": balanced_accuracy,
+                    "accuracy": accuracy,
+                    "source": str(path),
+                    "source_priority": int(source_priority),
+                }
+            )
+    if not records:
+        raise FileNotFoundError(
+            "no usable formal clean4 baseline seed records found; "
+            f"checked={checked_sources or clean4_long_candidates(args)}"
+        )
+
+    raw = pd.DataFrame(records)
+    selected_rows: list[dict[str, Any]] = []
+    for key, group in raw.groupby(["session", "method", "seed"], sort=True):
+        ordered = group.sort_values(["source_priority", "source"]).reset_index(drop=True)
+        reference = ordered.iloc[0]
+        same_ba = np.isclose(
+            ordered["balanced_accuracy"].to_numpy(float),
+            float(reference["balanced_accuracy"]),
+            rtol=0.0,
+            atol=1e-12,
+        ).all()
+        same_accuracy = np.isclose(
+            ordered["accuracy"].to_numpy(float),
+            float(reference["accuracy"]),
+            rtol=0.0,
+            atol=1e-12,
+        ).all()
+        if not (same_ba and same_accuracy):
+            details = ordered[
+                ["source", "source_priority", "balanced_accuracy", "accuracy"]
+            ].to_dict(orient="records")
+            raise AssertionError(
+                "conflicting formal clean4 duplicate for "
+                f"session={key[0]} method={key[1]} seed={key[2]}: {details}"
+            )
+        winner = reference.to_dict()
+        winner["duplicate_sources_checked"] = canonical_json(
+            ordered["source"].astype(str).tolist()
+        )
+        selected_rows.append(winner)
+
+    selected = pd.DataFrame(selected_rows)
+    expected_keys = {
+        (session, method, seed)
+        for session in EXPECTED_SESSIONS
+        for method in selected_methods
+        for seed in SEEDS
+    }
+    observed_keys = set(
+        zip(selected["session"], selected["method"], selected["seed"].astype(int))
+    )
+    missing = sorted(expected_keys - observed_keys)
+    unexpected = sorted(observed_keys - expected_keys)
+    if missing or unexpected:
+        raise AssertionError(
+            "formal clean4 seed coverage mismatch after merging all candidates: "
+            f"missing={missing}, unexpected={unexpected}, checked={checked_sources}"
+        )
+    if len(selected) != len(EXPECTED_SESSIONS) * len(selected_methods) * len(SEEDS):
+        raise AssertionError("formal clean4 seed records are not unique after merge")
+    return selected.sort_values(["session", "method", "seed"]).reset_index(drop=True)
+
+
 def load_existing_comparison_baselines(args: argparse.Namespace) -> pd.DataFrame:
     """Read exactly four frozen baselines; never retrain them in this runner."""
-    clean_path = _first_existing(clean4_long_candidates(args), "clean4 baseline table")
-    clean = pd.read_csv(clean_path, dtype={"session": str})
-    if "task" in clean.columns:
-        clean = clean[clean["task"].astype(str).eq(TASK_NAME)]
-    required_clean = {"session", "method", "seed", "balanced_accuracy", "accuracy"}
-    if not required_clean.issubset(clean.columns):
-        raise AssertionError("formal clean4 long table lacks required numeric columns")
-    clean = clean[clean["method"].isin([LOCAL_BASELINE_NAME, "fcnn_meanpool"])]
+    clean = load_clean4_formal_seed_records(args)
     clean_rows: list[dict[str, Any]] = []
     for (session, method), group in clean.groupby(["session", "method"], sort=True):
-        if group["seed"].nunique() != len(SEEDS):
+        if len(group) != len(SEEDS) or set(group["seed"].astype(int)) != set(SEEDS):
             raise AssertionError(f"{session} {method}: expected exactly three formal seeds")
         clean_rows.append(
             {
@@ -1090,7 +1185,7 @@ def load_existing_comparison_baselines(args: argparse.Namespace) -> pd.DataFrame
                 "std_BA": float(group["balanced_accuracy"].astype(float).std(ddof=1)),
                 "mean_accuracy": float(group["accuracy"].astype(float).mean()),
                 "n_seeds": int(group["seed"].nunique()),
-                "source": str(clean_path),
+                "source": canonical_json(group["source"].astype(str).tolist()),
                 "retrained_by_this_runner": False,
             }
         )

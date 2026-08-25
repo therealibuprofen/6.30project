@@ -549,6 +549,119 @@ def test_resume_validation_is_mode_specific(tmp_path: Path, model_name: str) -> 
         assert valid is False and "final alpha" in reason
 
 
+def _write_clean4_formal_table(path: Path, sessions: list[str], *, conflict: bool = False) -> None:
+    rows = []
+    for session_index, session in enumerate(sessions):
+        for method_index, method in enumerate(("cnn2d_temporal1d", "fcnn_meanpool")):
+            for seed in (0, 1, 2):
+                value = 0.50 + 0.01 * session_index + 0.001 * method_index + 0.0001 * seed
+                if conflict and session == "708" and method == "cnn2d_temporal1d" and seed == 0:
+                    value += 0.05
+                rows.append(
+                    {
+                        "session": session,
+                        "task": "binary",
+                        "method": method,
+                        "seed": seed,
+                        "balanced_accuracy": value,
+                        "accuracy": value - 0.01,
+                    }
+                )
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_external_summary(path: Path, model: str, sessions: tuple[str, ...]) -> None:
+    pd.DataFrame(
+        [
+            {
+                "session": session,
+                "model": model,
+                "mean_BA": 0.6,
+                "std_BA": 0.01,
+                "mean_accuracy": 0.59,
+            }
+            for session in sessions
+        ]
+    ).to_csv(path, index=False)
+
+
+def test_clean4_loader_merges_7_session_and_priority_9_session_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = load_runner()
+    seven = tmp_path / "older_7_session.csv"
+    nine = tmp_path / "formal_9_session.csv"
+    older_sessions = [
+        session for session in runner.EXPECTED_SESSIONS if session not in {"626", "628"}
+    ]
+    _write_clean4_formal_table(seven, older_sessions)
+    # Use the same per-session metrics for duplicate sessions while adding 626/628.
+    full_rows = pd.read_csv(seven, dtype={"session": str})
+    additions = []
+    for session_index, session in enumerate(("626", "628")):
+        for method_index, method in enumerate(("cnn2d_temporal1d", "fcnn_meanpool")):
+            for seed in (0, 1, 2):
+                value = 0.55 + 0.01 * session_index + 0.001 * method_index + 0.0001 * seed
+                additions.append(
+                    {
+                        "session": session,
+                        "task": "binary",
+                        "method": method,
+                        "seed": seed,
+                        "balanced_accuracy": value,
+                        "accuracy": value - 0.01,
+                    }
+                )
+    pd.concat([pd.DataFrame(additions), full_rows], ignore_index=True).to_csv(
+        nine, index=False
+    )
+    mamba = tmp_path / "mamba.csv"
+    transformer = tmp_path / "transformer.csv"
+    _write_external_summary(mamba, "spatial_mamba", runner.EXPECTED_SESSIONS)
+    _write_external_summary(
+        transformer, "cnn_factorized_transformer", runner.EXPECTED_SESSIONS
+    )
+    # Deliberately put the incomplete table first to reproduce the server bug.
+    monkeypatch.setattr(runner, "clean4_long_candidates", lambda args: [seven, nine])
+    monkeypatch.setattr(runner, "mamba_summary_candidates", lambda args: [mamba])
+    monkeypatch.setattr(
+        runner, "transformer_summary_candidates", lambda args: [transformer]
+    )
+    args = SimpleNamespace(project_root=tmp_path, benchmark_root=tmp_path)
+    seed_records = runner.load_clean4_formal_seed_records(args)
+    assert len(seed_records) == 9 * 2 * 3
+    assert set(seed_records["session"]) == set(runner.EXPECTED_SESSIONS)
+    assert set(seed_records["method"]) == {"cnn2d_temporal1d", "fcnn_meanpool"}
+    for session in ("626", "628"):
+        selected = seed_records[seed_records["session"].eq(session)]
+        assert len(selected) == 2 * 3
+        assert selected["source"].eq(str(nine)).all()
+    combined = runner.load_existing_comparison_baselines(args)
+    assert len(combined) == 9 * 4
+    assert set(combined["session"]) == set(runner.EXPECTED_SESSIONS)
+
+
+def test_clean4_loader_rejects_conflicting_duplicate_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = load_runner()
+    first = tmp_path / "formal_priority_0.csv"
+    conflicting = tmp_path / "formal_priority_1_conflict.csv"
+    sessions = list(runner.EXPECTED_SESSIONS)
+    _write_clean4_formal_table(first, sessions)
+    _write_clean4_formal_table(conflicting, sessions, conflict=True)
+    monkeypatch.setattr(
+        runner, "clean4_long_candidates", lambda args: [first, conflicting]
+    )
+    with pytest.raises(
+        AssertionError,
+        match="conflicting formal clean4 duplicate.*session=708.*cnn2d_temporal1d.*seed=0",
+    ):
+        runner.load_clean4_formal_seed_records(
+            SimpleNamespace(project_root=tmp_path, benchmark_root=tmp_path)
+        )
+
+
 def test_existing_formal_baselines_are_read_not_retrained() -> None:
     runner = load_runner()
     args = SimpleNamespace(

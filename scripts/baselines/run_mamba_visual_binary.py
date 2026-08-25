@@ -935,6 +935,9 @@ def clean4_long_candidates(args: argparse.Namespace) -> list[Path]:
         args.project_root / "outputs" / "block_clean4_binary_all_models_9sessions_v1"
         / "aggregate" / "multiframe_all_models_master_long.csv",
         args.project_root / "results" / "runs" / "multiframe"
+        / "block_clean4_binary_all_models_9sessions_v1"
+        / "aggregate" / "multiframe_all_models_master_long.csv",
+        args.project_root / "results" / "runs" / "multiframe"
         / "block_clean4_binary_all_models_v1" / "aggregate" / "multiframe_all_models_master_long.csv",
         args.benchmark_root / "aggregate" / "multiframe_master_summary.csv",
     ]
