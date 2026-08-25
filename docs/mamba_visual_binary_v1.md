@@ -27,7 +27,7 @@ CNN stem 直接复用已审查 `cnn_factorized_transformer` 的模块：三层�
 Mamba dependency is not installed. Use the dedicated server Mamba environment.
 ```
 
-`requirements_mamba.txt` 只记录实际冻结的专用 Linux/CUDA 环境，不自动安装、不修改基础 requirements：Python 3.10、PyTorch 2.1.2+cu118、mamba-ssm 2.2.2、causal-conv1d 1.4.0、transformers 4.48.3、numpy 1.26.4、scipy 1.13.1、pandas 2.3.3、scikit-learn 1.6.1。代码始终使用 `from mamba_ssm import Mamba`，不调用 Mamba2/Mamba3。
+`requirements_mamba.txt` 只记录实际冻结的专用 Linux/CUDA 环境，不自动安装、不修改基础 requirements：Python 3.10、PyTorch 2.1.2+cu118、mamba-ssm 2.2.2、causal-conv1d 1.4.0、transformers 4.48.3、numpy 1.26.4、scipy 1.13.1、pandas 2.3.3、scikit-learn 1.6.1、h5py 3.11.0。代码始终使用 `from mamba_ssm import Mamba`，不调用 Mamba2/Mamba3。
 
 ## 参数和结果完整性
 

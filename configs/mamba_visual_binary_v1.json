@@ -29,7 +29,8 @@
     "numpy": "1.26.4",
     "scipy": "1.13.1",
     "pandas": "2.3.3",
-    "scikit-learn": "1.6.1"
+    "scikit-learn": "1.6.1",
+    "h5py": "3.11.0"
   },
   "model_config": {
     "stem_channels": [16, 32, 64],

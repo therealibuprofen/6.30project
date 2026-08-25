@@ -233,6 +233,7 @@ def test_documented_frozen_server_environment_is_exact() -> None:
         "scipy": "1.13.1",
         "pandas": "2.3.3",
         "scikit-learn": "1.6.1",
+        "h5py": "3.11.0",
     }
     requirement_lines = {
         line.strip()
@@ -250,6 +251,7 @@ def test_documented_frozen_server_environment_is_exact() -> None:
         "scipy==1.13.1",
         "pandas==2.3.3",
         "scikit-learn==1.6.1",
+        "h5py==3.11.0",
     }
 
 
