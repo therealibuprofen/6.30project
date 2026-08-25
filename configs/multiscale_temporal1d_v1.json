@@ -1,0 +1,84 @@
+{
+  "output_version": "multiscale_temporal1d_v1",
+  "implementation_version": "multiscale_temporal1d_v1.0.0",
+  "claim": "lightweight multi-scale spatial receptive-field candidate",
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "strong_sessions": ["708", "709", "710"],
+  "weak_sessions": ["626", "628", "807", "813", "817", "822"],
+  "task": "within-session binary stimulus presence",
+  "input": "formal clean4 [B,4,128,501], one block per sample",
+  "folds": "exact formal cycle-level folds, max_folds=10",
+  "normalization": "arcsinh then pixel z-score fitted on outer train fold only",
+  "seeds": [0, 1, 2],
+  "training": {
+    "optimizer": "AdamW",
+    "lr": 0.001,
+    "weight_decay": 0.001,
+    "batch_size": 16,
+    "max_epochs": 40,
+    "dropout": 0.25,
+    "loss": "cross_entropy",
+    "epoch_selection": "fixed 40; no early stopping or test/validation selection"
+  },
+  "formal_temporal1d_audit": {
+    "frame_encoder": [
+      "Conv2d(1,8,kernel_size=(5,9),padding=(2,4),stride=1)",
+      "BatchNorm2d(8)",
+      "ReLU",
+      "MaxPool2d(kernel_size=(2,4))",
+      "Conv2d(8,16,kernel_size=(5,7),padding=(2,3),stride=1)",
+      "BatchNorm2d(16)",
+      "ReLU",
+      "AdaptiveAvgPool2d((4,8))",
+      "Flatten"
+    ],
+    "spatial_output": "[B*T,16,4,8]",
+    "frame_feature_dim": 512,
+    "temporal_head": "Conv1d(512,64,3,padding=1), BatchNorm1d(64), ReLU, Conv1d(64,64,3,padding=1), ReLU, AdaptiveAvgPool1d(1), Flatten",
+    "classifier": "Dropout(0.25), Linear(64,2)",
+    "parameter_count": 115890
+  },
+  "mechanistic_models": {
+    "same_backbone_single_scale": {
+      "first_stage": "exact formal SmallCNN first stage",
+      "second_stage": "Conv2d(8,16,3,padding=1,dilation=1)",
+      "post_stage": "BatchNorm2d(16), ReLU, AdaptiveAvgPool2d((4,8)), Flatten",
+      "frame_feature_dim": 512,
+      "parameter_count": 112562
+    },
+    "multiscale_temporal1d": {
+      "first_stage": "exact formal SmallCNN first stage",
+      "second_stage": "parallel Conv2d(8,8,3,padding=1,dilation=1) plus Conv2d(8,8,3,padding=2,dilation=2), channel concat",
+      "fusion": "concatenation only; no gate, projection, attention, or residual",
+      "post_stage": "BatchNorm2d(16), ReLU, AdaptiveAvgPool2d((4,8)), Flatten",
+      "frame_feature_dim": 512,
+      "parameter_count": 112562
+    }
+  },
+  "shared_temporal_and_classifier": "direct modules from formal CNN2DTemporal1D; unchanged",
+  "mechanistic_comparison": "multiscale_temporal1d vs same_backbone_single_scale",
+  "external_baselines_read_only": [
+    "cnn2d_temporal1d",
+    "fcnn_meanpool",
+    "cnn_factorized_transformer",
+    "spatial_mamba",
+    "local_global_residual_mamba"
+  ],
+  "success_rule": {
+    "multiscale_mean_BA_above_single_scale": true,
+    "non_decreasing_sessions_vs_single_scale_at_least": 6,
+    "strong_sessions_not_notably_down_at_least": 2,
+    "notable_decline_tolerance_BA": 0.02,
+    "mean_delta_vs_formal_temporal1d_at_least": 0.0,
+    "severe_overfit_not_worse_than_complex_mamba": true
+  },
+  "formal_compute": {
+    "environment": "/data2/yuq1ngr/conda_envs/fus",
+    "device": "CUDA",
+    "background_runner": "GNU screen only",
+    "full_stage_requires_flag": "--review-approved",
+    "run_before_review_greenlight": false
+  },
+  "expected_formal_task_count": 492,
+  "automatic_next_stage": false
+}
