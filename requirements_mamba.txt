@@ -1,3 +1,11 @@
-# Optional, dedicated CUDA server environment only. Do not install into the base project environment.
-# Suggested official package release; the model code imports Mamba (Mamba-1), not Mamba2/Mamba3.
-mamba-ssm==2.3.2.post1
+# Documentation-only snapshot of the frozen dedicated server environment.
+# Do not install automatically and do not modify the base project environment.
+# Python==3.10
+torch==2.1.2+cu118
+mamba-ssm==2.2.2
+causal-conv1d==1.4.0
+transformers==4.48.3
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.3.3
+scikit-learn==1.6.1

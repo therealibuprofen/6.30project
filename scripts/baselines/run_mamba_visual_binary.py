@@ -75,6 +75,15 @@ REQUIRED_FINAL_OUTPUTS = (
     "overfitting_summary.csv",
     "mamba_report.md",
 )
+RUNTIME_DISTRIBUTIONS = {
+    "mamba_ssm_version": "mamba-ssm",
+    "causal_conv1d_version": "causal-conv1d",
+    "transformers_version": "transformers",
+    "numpy_version": "numpy",
+    "scipy_version": "scipy",
+    "pandas_version": "pandas",
+    "scikit_learn_version": "scikit-learn",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,15 +160,35 @@ def git_text(project_root: Path, *args: str) -> str:
         return f"unavailable: {exc}"
 
 
+def distribution_version(distribution: str) -> str:
+    try:
+        return str(importlib_metadata.version(distribution))
+    except importlib_metadata.PackageNotFoundError:
+        return "NOT_INSTALLED"
+
+
+def runtime_environment_signature() -> dict[str, str]:
+    """Stable task identity fields; excludes host, time, GPU load, and paths."""
+    signature = {
+        "python_version": platform.python_version(),
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": str(torch.version.cuda or "NONE"),
+    }
+    signature.update(
+        {
+            field: distribution_version(distribution)
+            for field, distribution in RUNTIME_DISTRIBUTIONS.items()
+        }
+    )
+    return signature
+
+
 def environment_payload(device: str) -> dict[str, Any]:
     cuda_available = bool(torch.cuda.is_available())
     resolved = device
     if device == "auto":
         resolved = "cuda" if cuda_available else "cpu"
-    try:
-        mamba_version = importlib_metadata.version("mamba-ssm")
-    except importlib_metadata.PackageNotFoundError:
-        mamba_version = None
+    runtime_signature = runtime_environment_signature()
     return {
         "compute_environment": "server" if resolved.startswith("cuda") else "local_sanity_or_cpu",
         "created_utc": utc_now(),
@@ -175,8 +204,9 @@ def environment_payload(device: str) -> dict[str, Any]:
         "requested_device": device,
         "resolved_device": resolved,
         "mamba_dependency_available": mamba_dependency_available(),
-        "mamba_ssm_version": mamba_version,
         "mamba_dependency_required_for_training": True,
+        **runtime_signature,
+        "runtime_environment_signature": runtime_signature,
     }
 
 
@@ -225,6 +255,7 @@ def run_identity(project_root: Path, batch_size: int) -> dict[str, Any]:
     ]
     return {
         "experiment_config": frozen_experiment_config(batch_size),
+        "runtime_environment_signature": runtime_environment_signature(),
         "git_commit": git_text(project_root, "rev-parse", "HEAD"),
         "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
         # File hashes also protect dirty/uncommitted code whose commit string has
@@ -371,6 +402,7 @@ def task_fingerprint(run_fingerprint: str, row: dict[str, Any]) -> str:
             "fold": int(row["fold"]),
             "n_test_samples": int(row["n_test_samples"]),
             "config_fingerprint": str(row["config_fingerprint"]),
+            "runtime_environment_fingerprint": str(row["runtime_environment_fingerprint"]),
             "batch_size": int(row["batch_size"]),
         }
     )
@@ -421,6 +453,13 @@ def validate_completed_task(
         or result.get("config_fingerprint") != str(expected["config_fingerprint"])
     ):
         return fail("experiment config fingerprint mismatch")
+    if (
+        complete.get("runtime_environment_fingerprint")
+        != str(expected["runtime_environment_fingerprint"])
+        or result.get("runtime_environment_fingerprint")
+        != str(expected["runtime_environment_fingerprint"])
+    ):
+        return fail("runtime environment fingerprint mismatch")
     expected_identity = (
         str(expected["session"]), MODEL_NAME, int(expected["seed"]), int(expected["fold"]),
     )
@@ -549,6 +588,7 @@ def validate_completed_task(
 def build_task_plan(args: argparse.Namespace, identity: dict[str, Any]) -> pd.DataFrame:
     run_fp = fingerprint(identity)
     config_fp = fingerprint(identity["experiment_config"])
+    runtime_fp = fingerprint(identity["runtime_environment_signature"])
     batch_size = int(identity["experiment_config"]["training"]["batch_size"])
     rows: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
@@ -568,6 +608,7 @@ def build_task_plan(args: argparse.Namespace, identity: dict[str, Any]) -> pd.Da
                     "n_test_samples": len(test_idx),
                     "task_key": task_key(session, seed, fold),
                     "config_fingerprint": config_fp,
+                    "runtime_environment_fingerprint": runtime_fp,
                     "batch_size": batch_size,
                 }
                 row["task_fingerprint"] = task_fingerprint(run_fp, row)
@@ -581,6 +622,7 @@ def build_task_plan(args: argparse.Namespace, identity: dict[str, Any]) -> pd.Da
         {
             "run_fingerprint": run_fp,
             "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
+            "runtime_environment_signature": identity["runtime_environment_signature"],
             "total_tasks": len(plan),
             "task_definition": "session x one_model x seed x fold",
             "created_utc": utc_now(),
@@ -805,7 +847,9 @@ def write_fold_task(
     result_payload = {
         "run_fingerprint": run_fp, "task_fingerprint": task_fp,
         "config_fingerprint": str(expected["config_fingerprint"]),
+        "runtime_environment_fingerprint": str(expected["runtime_environment_fingerprint"]),
         "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
+        "runtime_environment_signature": identity["runtime_environment_signature"],
         "session": session, "model": MODEL_NAME, "seed": seed, "fold": fold,
         "n_cycles": data.n_cycles, "n_samples": data.n_blocks,
         "n_train_samples": len(train_idx), "n_test_samples": len(test_idx),
@@ -839,6 +883,7 @@ def write_fold_task(
             "task_key": task_key(session, seed, fold),
             "run_fingerprint": run_fp, "task_fingerprint": task_fp,
             "config_fingerprint": str(expected["config_fingerprint"]),
+            "runtime_environment_fingerprint": str(expected["runtime_environment_fingerprint"]),
             "completed_utc": utc_now(),
             "validated_files": [
                 "result.json", "predictions.csv", "confusion_matrix.csv",
@@ -1368,6 +1413,7 @@ def run_full(args: argparse.Namespace, identity: dict[str, Any]) -> None:
             "status": "complete", "compute_environment": "server",
             "completed_utc": utc_now(), "run_fingerprint": run_fp,
             "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
+            "runtime_environment_signature": identity["runtime_environment_signature"],
             "completed_tasks": len(plan), "total_tasks": len(plan),
             "required_outputs": list(REQUIRED_FINAL_OUTPUTS),
             "strict_task_revalidation_before_aggregation": True,

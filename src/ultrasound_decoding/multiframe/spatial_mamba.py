@@ -27,7 +27,7 @@ from .training import (
 
 MODEL_NAME = "spatial_mamba"
 MODEL_DISPLAY_NAME = "Spatial Mamba"
-MODEL_IMPLEMENTATION_VERSION = "spatial_mamba_v1.0.0"
+MODEL_IMPLEMENTATION_VERSION = "spatial_mamba_v1.1.0"
 TRANSFORMER_REFERENCE_PARAMETER_COUNT = 127_010
 MAMBA_DEPENDENCY_MESSAGE = (
     "Mamba dependency is not installed. Use the dedicated server Mamba environment."
@@ -136,17 +136,18 @@ class SpatialMambaClassifier(nn.Module):
         # modules. Its spatial Transformer is intentionally not retained.
         reference = CNNFactorizedTransformer(transformer_reference_config(cfg))
         self.stem = reference.stem
+        # Reuse the reviewed Transformer's exact learnable 2D row+column
+        # positional parameterization. No additional flat [1,256,64] position
+        # parameter is retained in Spatial-Mamba v1.1.
+        self.spatial_row_position = reference.spatial_row_position
+        self.spatial_column_position = reference.spatial_column_position
         self.temporal_position = reference.temporal_position
         self.temporal_transformer = reference.temporal_transformer
         self.classifier = reference.classifier
 
-        self.spatial_position = nn.Parameter(
-            torch.empty(1, cfg.pooled_height * cfg.pooled_width, cfg.d_model)
-        )
         self.spatial_mamba = nn.ModuleList(
             [BidirectionalSharedMambaLayer(cfg) for _ in range(cfg.spatial_mamba_layers)]
         )
-        nn.init.trunc_normal_(self.spatial_position, std=0.02)
 
     def _canonical_input(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 4:
@@ -174,11 +175,17 @@ class SpatialMambaClassifier(nn.Module):
             self.config.pooled_height,
             self.config.pooled_width,
         )
-        # permute then reshape is fixed row-major traversal: width changes fastest.
-        spatial_tokens = cnn.permute(0, 2, 3, 1).contiguous().reshape(
+        spatial_grid = cnn.permute(0, 2, 3, 1)
+        spatial_grid = (
+            spatial_grid
+            + self.spatial_row_position
+            + self.spatial_column_position
+        )
+        # Flatten the positioned [8,32] grid in fixed row-major order: width
+        # changes fastest, exactly as in the controlled Transformer baseline.
+        spatial_tokens = spatial_grid.contiguous().reshape(
             batch_size * temporal_length, 256, self.config.d_model
         )
-        spatial_tokens = spatial_tokens + self.spatial_position
         spatial_encoded = spatial_tokens
         for layer in self.spatial_mamba:
             spatial_encoded = layer(spatial_encoded)
@@ -216,7 +223,8 @@ def parameter_breakdown(model: SpatialMambaClassifier) -> dict[str, int]:
     parts = {
         "cnn_stem_parameters": count_trainable_parameters(model.stem),
         "spatial_mamba_parameters": (
-            int(model.spatial_position.numel())
+            int(model.spatial_row_position.numel())
+            + int(model.spatial_column_position.numel())
             + count_trainable_parameters(model.spatial_mamba)
         ),
         "temporal_transformer_parameters": (
@@ -244,7 +252,18 @@ def architecture_config(config: SpatialMambaConfig | None = None) -> dict[str, A
         "spatial_flatten_order": "row-major (width index changes fastest)",
         "spatial_scan": "bidirectional shared-weight spatial scan",
         "bidirectional_merge": "0.5 * (forward + reverse(backward))",
-        "spatial_position": "learnable [1,256,64], label-independent, shared across frames/sessions",
+        "spatial_position": (
+            "exact Transformer v1 learnable 2D row+column form: "
+            "row [1,8,1,64] + column [1,1,32,64]; label-independent and shared"
+        ),
+        "spatial_position_parameter_count": (
+            cfg.pooled_height * cfg.d_model + cfg.pooled_width * cfg.d_model
+        ),
+        "spatial_position_parameter_delta_vs_v1_0": (
+            (cfg.pooled_height + cfg.pooled_width) * cfg.d_model
+            - cfg.pooled_height * cfg.pooled_width * cfg.d_model
+        ),
+        "flat_spatial_position_parameter_present": False,
         "temporal_path": "exact modules reused from cnn_factorized_transformer v1",
         "causal_temporal_mask": False,
         "transformer_reference_parameter_count": TRANSFORMER_REFERENCE_PARAMETER_COUNT,

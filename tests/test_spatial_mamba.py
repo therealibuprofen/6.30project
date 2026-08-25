@@ -63,7 +63,7 @@ class FakeMamba(nn.Module):
 def test_project_import_and_config_do_not_require_optional_dependency() -> None:
     payload = architecture_config()
     assert payload["model"] == MODEL_NAME
-    assert payload["model_implementation_version"] == MODEL_IMPLEMENTATION_VERSION
+    assert payload["model_implementation_version"] == MODEL_IMPLEMENTATION_VERSION == "spatial_mamba_v1.1.0"
     assert payload["dependency"] == "official mamba_ssm.Mamba"
     assert payload["spatial_scan"] == "bidirectional shared-weight spatial scan"
     assert payload["config"]["d_model"] == 64
@@ -71,6 +71,9 @@ def test_project_import_and_config_do_not_require_optional_dependency() -> None:
     assert payload["config"]["d_conv"] == 4
     assert payload["config"]["expand"] == 2
     assert payload["config"]["spatial_mamba_layers"] == 2
+    assert payload["flat_spatial_position_parameter_present"] is False
+    assert payload["spatial_position_parameter_count"] == (8 + 32) * 64
+    assert payload["spatial_position_parameter_delta_vs_v1_0"] == -13_824
 
 
 def test_missing_dependency_error_is_explicit_when_unavailable() -> None:
@@ -105,7 +108,13 @@ def test_stem_temporal_and_classifier_are_direct_reviewed_module_reuse(
     assert repr(model.temporal_transformer) == repr(reference.temporal_transformer)
     assert repr(model.classifier) == repr(reference.classifier)
     assert model.temporal_position.shape == reference.temporal_position.shape == (1, 4, 64)
-    assert model.spatial_position.shape == (1, 256, 64)
+    assert model.spatial_row_position.shape == reference.spatial_row_position.shape == (1, 8, 1, 64)
+    assert model.spatial_column_position.shape == reference.spatial_column_position.shape == (1, 1, 32, 64)
+    assert not hasattr(model, "spatial_position")
+    parameter_names = {name for name, _ in model.named_parameters()}
+    assert "spatial_row_position" in parameter_names
+    assert "spatial_column_position" in parameter_names
+    assert "spatial_position" not in parameter_names
 
 
 def test_fake_mamba_full_shapes_backward_and_parameter_breakdown(
@@ -182,12 +191,66 @@ def test_runner_config_fingerprint_and_fixed_batch_policy() -> None:
     assert config["seeds"] == [0, 1, 2]
     base = {
         "experiment_config": config, "git_commit": "abc",
+        "runtime_environment_signature": {"torch_version": "2.1.2+cu118"},
         "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
         "model_source_sha256": "m", "runner_source_sha256": "r",
         "transitive_project_source_sha256": {"dependency.py": "one"},
     }
     changed = dict(base, transitive_project_source_sha256={"dependency.py": "two"})
     assert runner.fingerprint(base) != runner.fingerprint(changed)
+    changed_runtime = dict(
+        base, runtime_environment_signature={"torch_version": "different"}
+    )
+    assert runner.fingerprint(base) != runner.fingerprint(changed_runtime)
+
+
+def test_runtime_environment_signature_has_all_stable_required_fields() -> None:
+    runner = load_runner()
+    signature = runner.runtime_environment_signature()
+    assert set(signature) == {
+        "python_version", "torch_version", "torch_cuda_version",
+        "mamba_ssm_version", "causal_conv1d_version", "transformers_version",
+        "numpy_version", "scipy_version", "pandas_version", "scikit_learn_version",
+    }
+    assert all(isinstance(value, str) and value for value in signature.values())
+    identity = runner.run_identity(PROJECT_DIR, 16)
+    assert identity["runtime_environment_signature"] == signature
+
+
+def test_documented_frozen_server_environment_is_exact() -> None:
+    config = json.loads(
+        (PROJECT_DIR / "configs" / "mamba_visual_binary_v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["frozen_server_environment"] == {
+        "python": "3.10",
+        "torch": "2.1.2+cu118",
+        "mamba-ssm": "2.2.2",
+        "causal-conv1d": "1.4.0",
+        "transformers": "4.48.3",
+        "numpy": "1.26.4",
+        "scipy": "1.13.1",
+        "pandas": "2.3.3",
+        "scikit-learn": "1.6.1",
+    }
+    requirement_lines = {
+        line.strip()
+        for line in (PROJECT_DIR / "requirements_mamba.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+    assert requirement_lines == {
+        "torch==2.1.2+cu118",
+        "mamba-ssm==2.2.2",
+        "causal-conv1d==1.4.0",
+        "transformers==4.48.3",
+        "numpy==1.26.4",
+        "scipy==1.13.1",
+        "pandas==2.3.3",
+        "scikit-learn==1.6.1",
+    }
 
 
 def test_manifest_dtype_normalization_and_exact_sign_flip() -> None:
@@ -259,6 +322,7 @@ def _write_valid_task_artifacts(path: Path, runner, expected: dict[str, object])
     result = {
         "run_fingerprint": run_fingerprint, "task_fingerprint": task_fingerprint,
         "config_fingerprint": "config-fingerprint",
+        "runtime_environment_fingerprint": "runtime-fingerprint",
         "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
         "session": "626", "model": MODEL_NAME, "seed": 0, "fold": 1,
         "n_test_samples": 4, "balanced_accuracy": 1.0, "accuracy": 1.0,
@@ -271,6 +335,7 @@ def _write_valid_task_artifacts(path: Path, runner, expected: dict[str, object])
             {
                 "task_key": "626:spatial_mamba:0:1", "run_fingerprint": run_fingerprint,
                 "task_fingerprint": task_fingerprint, "config_fingerprint": "config-fingerprint",
+                "runtime_environment_fingerprint": "runtime-fingerprint",
             }
         )
     )
@@ -281,10 +346,17 @@ def test_strict_completed_task_revalidation(tmp_path: Path) -> None:
     expected = {
         "session": "626", "model": MODEL_NAME, "seed": 0, "fold": 1,
         "n_test_samples": 4, "config_fingerprint": "config-fingerprint", "batch_size": 16,
+        "runtime_environment_fingerprint": "runtime-fingerprint",
     }
     _write_valid_task_artifacts(tmp_path, runner, expected)
     valid, reason = runner.validate_completed_task(tmp_path, expected, "run-fingerprint")
     assert valid is True, reason
+    changed_runtime = dict(expected, runtime_environment_fingerprint="different-runtime")
+    valid, reason = runner.validate_completed_task(
+        tmp_path, changed_runtime, "run-fingerprint"
+    )
+    assert valid is False
+    assert "task fingerprint mismatch" in reason
     result = json.loads((tmp_path / "result.json").read_text())
     result["spatial_mamba_parameters"] += 1
     (tmp_path / "result.json").write_text(json.dumps(result))
