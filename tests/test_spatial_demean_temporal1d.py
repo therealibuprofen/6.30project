@@ -181,7 +181,7 @@ def test_exact_sign_flip_reuses_project_512_pattern_implementation() -> None:
     assert runner.exact_two_sided_sign_flip(np.ones(9)) == pytest.approx(2 / 512)
 
 
-def test_required_summary_schema_and_prior_overfit_definition() -> None:
+def test_required_summary_schema_and_historical_final_epoch_overfit_definition() -> None:
     runner = load_runner()
     fold_rows, prediction_rows, history_rows = [], [], []
     truth = np.asarray([0, 0, 1, 1])
@@ -189,24 +189,25 @@ def test_required_summary_schema_and_prior_overfit_definition() -> None:
         for variant in runner.INPUT_VARIANTS:
             predicted = truth if variant == SPATIAL_DEMEAN_VARIANT else np.asarray([0, 1, 1, 0])
             for seed in runner.SEEDS:
-                fold_rows.append(
-                    {
-                        "session": session,
-                        "variant": variant,
-                        "seed": seed,
-                        "fold": 1,
-                        "n_samples": 4,
-                        "n_cycles": 1,
-                        "train_accuracy": 0.99,
-                    }
-                )
+                for fold in (1, 2):
+                    fold_rows.append(
+                        {
+                            "session": session,
+                            "variant": variant,
+                            "seed": seed,
+                            "fold": fold,
+                            "n_samples": 4,
+                            "n_cycles": 2,
+                            "train_accuracy": 0.99,
+                        }
+                    )
                 for sample_index, (y_true, y_pred) in enumerate(zip(truth, predicted)):
                     prediction_rows.append(
                         {
                             "session": session,
                             "variant": variant,
                             "seed": seed,
-                            "fold": 1,
+                            "fold": 1 if sample_index < 2 else 2,
                             "sample_index": sample_index,
                             "y_true": y_true,
                             "y_pred": y_pred,
@@ -221,7 +222,11 @@ def test_required_summary_schema_and_prior_overfit_definition() -> None:
                                 "seed": seed,
                                 "fold": fold,
                                 "epoch": epoch,
-                                "train_accuracy": 0.5 + 0.001 * epoch + 0.01 * fold,
+                                "train_accuracy": (
+                                    0.95 + 0.01 * fold
+                                    if epoch == 20
+                                    else 0.5 + 0.001 * epoch + 0.01 * fold
+                                ),
                             }
                         )
     seed_summary = runner.build_seed_summary(
@@ -237,9 +242,10 @@ def test_required_summary_schema_and_prior_overfit_definition() -> None:
         "train_accuracy",
         "train_test_gap",
     }.issubset(seed_summary.columns)
-    # At epoch 40 the two fold accuracies are .55 and .56; prior audit takes
-    # their epoch-wise mean and then the maximum over epochs.
+    # Epoch 20 is deliberately higher (.96/.97), but the historical formal
+    # audit uses fixed epoch 40 (.55/.56), averaged across folds.
     assert seed_summary.iloc[0]["train_accuracy"] == pytest.approx(0.555)
+    assert seed_summary.iloc[0]["train_test_gap"] == pytest.approx(0.055)
 
     session_summary = runner.build_session_summary(seed_summary)
     assert list(session_summary.columns) == [

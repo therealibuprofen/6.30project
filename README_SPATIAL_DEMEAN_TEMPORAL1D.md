@@ -17,6 +17,11 @@ frame's own global spatial mean improve within-session binary stimulus decoding?
   early stopping, or checkpoint selection. `best_epoch` in task results is only
   the descriptive epoch of maximum training accuracy; every test prediction is
   made after the fixed epoch 40 model.
+- Overfitting audit: for each seed, `train_accuracy` is the mean of that seed's
+  fold-level epoch-40 final train accuracies, matching the historical formal
+  `multiframe_all_models_overfitting_audit.csv`. Therefore
+  `train_test_gap = final epoch-40 train accuracy - OOF test BA`; descriptive
+  `best_epoch` and best train accuracy never enter the gap.
 - Raw control: rerun by this experiment. Historical raw results are not reused.
 - Fold provenance: one explicit completed
   `outputs/multiscale_temporal1d_v1` run, requiring version

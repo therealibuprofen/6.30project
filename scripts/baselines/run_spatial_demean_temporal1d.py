@@ -1059,14 +1059,21 @@ def build_seed_summary(
             & history["variant"].eq(str(variant))
             & history["seed"].eq(int(seed))
         ]
-        by_epoch = (
-            history_source.groupby("epoch")["train_accuracy"].mean().sort_index()
-        )
-        if len(by_epoch) != FORMAL_EPOCHS:
-            raise AssertionError("seed train-accuracy history is incomplete")
-        # Frozen prior overfitting-audit definition: average train accuracy
-        # across folds at each epoch, then report the maximum epoch mean.
-        train_accuracy = float(by_epoch.max())
+        final_history = history_source[
+            pd.to_numeric(history_source["epoch"]).eq(FORMAL_EPOCHS)
+        ].copy()
+        expected_folds = set(pd.to_numeric(fold_source["fold"]).astype(int))
+        observed_folds = set(pd.to_numeric(final_history["fold"]).astype(int))
+        if (
+            len(final_history) != len(expected_folds)
+            or final_history["fold"].duplicated().any()
+            or observed_folds != expected_folds
+        ):
+            raise AssertionError("seed final-epoch train-accuracy coverage is incomplete")
+        # Match the historical formal multiframe overfitting audit: use each
+        # fold's fixed epoch-40 final train accuracy, then average across folds
+        # for this seed. Descriptive best_epoch never enters the gap.
+        train_accuracy = float(final_history["train_accuracy"].astype(float).mean())
         mean_oof_ba = float(metrics["balanced_accuracy"])
         rows.append(
             {
