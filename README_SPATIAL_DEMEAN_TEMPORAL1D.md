@@ -58,7 +58,7 @@ maps, or hyperparameter selection.
 ## Local checks
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_spatial_demean_temporal1d.py
+PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_spatial_demean_temporal1d.py
 .venv/bin/python scripts/baselines/run_spatial_demean_temporal1d.py \
   --stage plan \
   --device cpu \
