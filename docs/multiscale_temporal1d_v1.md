@@ -6,6 +6,8 @@ This candidate asks only whether two spatial receptive fields improve clean4 wit
 
 The mechanistic comparison trains exactly `same_backbone_single_scale` and `multiscale_temporal1d`. Existing formal Temporal 1D-CNN, FCNN mean-pool, Factorized Transformer, Spatial Mamba, and Gated Mamba results are read only and are never retrained by this runner.
 
+The Gated Mamba external baseline is provenance-locked to the completed three-model run at `outputs/local_global_residual_mamba_v1_1`. Both `proposed_summary.csv` and `overfitting_comparison.csv` are read from that directory only, and the loader requires its `RUN_COMPLETE.json` to have `status: complete`. The gated summary must contain exactly one `local_global_residual_mamba` row for each of the nine frozen sessions. The earlier `outputs/local_global_residual_mamba_v1` run is not an automatic fallback.
+
 ## Formal Temporal 1D-CNN source audit
 
 The formal source is `SmallCNNFrameEncoder` plus `CNN2DTemporal1D` in `src/ultrasound_decoding/multiframe/models.py`.

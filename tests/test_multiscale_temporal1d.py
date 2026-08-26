@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -467,10 +468,37 @@ def test_decision_rule_is_pre_registered_and_stops() -> None:
     assert audit["automatic_next_stage_started"] is False
 
 
-def test_external_loader_never_retrains_formal_models(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _formal_summary(
+    path: Path, model: str, sessions: tuple[str, ...], mean_ba: float
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "session": session,
+                "model": model,
+                "mean_BA": mean_ba,
+                "std_BA": 0.01,
+                "mean_accuracy": mean_ba - 0.01,
+            }
+            for session in sessions
+        ]
+    ).to_csv(path, index=False)
+    return path
+
+
+def _completed_gated_v1_1(project_root: Path, status: str = "complete") -> Path:
+    run_dir = project_root / "outputs/local_global_residual_mamba_v1_1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "RUN_COMPLETE.json").write_text(
+        json.dumps({"status": status}) + "\n", encoding="utf-8"
+    )
+    return run_dir
+
+
+def _patch_non_gated_external_sources(
+    runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner = load_runner()
     clean_rows = []
     for session in runner.EXPECTED_SESSIONS:
         for method in (FORMAL_TEMPORAL_BASELINE_NAME, "fcnn_meanpool"):
@@ -490,41 +518,46 @@ def test_external_loader_never_retrains_formal_models(
         "load_clean4_formal_seed_records",
         lambda args: pd.DataFrame(clean_rows),
     )
-    summaries = {}
-    for model, filename in (
-        ("spatial_mamba", "mamba.csv"),
-        ("cnn_factorized_transformer", "transformer.csv"),
-        ("local_global_residual_mamba", "gated.csv"),
-    ):
-        path = tmp_path / filename
-        pd.DataFrame(
-            [
-                {
-                    "session": session,
-                    "model": model,
-                    "mean_BA": 0.6,
-                    "std_BA": 0.01,
-                    "mean_accuracy": 0.59,
-                }
-                for session in runner.EXPECTED_SESSIONS
-            ]
-        ).to_csv(path, index=False)
-        summaries[model] = path
+    mamba = _formal_summary(
+        tmp_path / "mamba.csv", "spatial_mamba", runner.EXPECTED_SESSIONS, 0.6
+    )
+    transformer = _formal_summary(
+        tmp_path / "transformer.csv",
+        "cnn_factorized_transformer",
+        runner.EXPECTED_SESSIONS,
+        0.6,
+    )
     monkeypatch.setattr(
         runner.prior_runner,
         "mamba_summary_candidates",
-        lambda args: [summaries["spatial_mamba"]],
+        lambda args: [mamba],
     )
     monkeypatch.setattr(
         runner.prior_runner,
         "transformer_summary_candidates",
-        lambda args: [summaries["cnn_factorized_transformer"]],
+        lambda args: [transformer],
     )
+
+
+def test_external_loader_uses_completed_gated_v1_1_not_legacy_v1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = load_runner()
+    _patch_non_gated_external_sources(runner, tmp_path, monkeypatch)
     project_root = tmp_path / "project"
-    gated_target = project_root / "outputs/local_global_residual_mamba_v1"
-    gated_target.mkdir(parents=True)
-    summaries["local_global_residual_mamba"].replace(
-        gated_target / "proposed_summary.csv"
+    old_path = _formal_summary(
+        project_root
+        / "outputs/local_global_residual_mamba_v1/proposed_summary.csv",
+        "local_global_residual_mamba",
+        runner.EXPECTED_SESSIONS,
+        0.57,
+    )
+    gated_run_dir = _completed_gated_v1_1(project_root)
+    formal_path = _formal_summary(
+        gated_run_dir / "proposed_summary.csv",
+        "local_global_residual_mamba",
+        runner.EXPECTED_SESSIONS,
+        0.59,
     )
     frame = runner.load_external_baselines(
         SimpleNamespace(project_root=project_root, benchmark_root=tmp_path)
@@ -532,3 +565,90 @@ def test_external_loader_never_retrains_formal_models(
     assert len(frame) == 9 * 5
     assert set(frame["model"]) == set(runner.EXTERNAL_BASELINES)
     assert not frame["retrained_by_this_runner"].any()
+    gated = frame[frame["model"].eq("local_global_residual_mamba")]
+    assert np.allclose(gated["mean_BA"], 0.59)
+    assert set(gated["source"]) == {str(formal_path)}
+    assert str(old_path) not in set(gated["source"])
+    assert set(gated["source_run_complete"]) == {
+        str(gated_run_dir / "RUN_COMPLETE.json")
+    }
+    assert set(gated["source_run_status"]) == {"complete"}
+
+
+@pytest.mark.parametrize("manifest_status", [None, "failed"])
+def test_gated_v1_1_missing_or_invalid_completion_never_falls_back_to_legacy(
+    tmp_path: Path, manifest_status: Optional[str]
+) -> None:
+    runner = load_runner()
+    project_root = tmp_path / "project"
+    _formal_summary(
+        project_root
+        / "outputs/local_global_residual_mamba_v1/proposed_summary.csv",
+        "local_global_residual_mamba",
+        runner.EXPECTED_SESSIONS,
+        0.57,
+    )
+    formal_run_dir = project_root / "outputs/local_global_residual_mamba_v1_1"
+    _formal_summary(
+        formal_run_dir / "proposed_summary.csv",
+        "local_global_residual_mamba",
+        runner.EXPECTED_SESSIONS,
+        0.59,
+    )
+    if manifest_status is not None:
+        _completed_gated_v1_1(project_root, status=manifest_status)
+    args = SimpleNamespace(project_root=project_root)
+    error = FileNotFoundError if manifest_status is None else AssertionError
+    with pytest.raises(error, match="RUN_COMPLETE|completion"):
+        runner.validate_gated_mamba_formal_run(args)
+
+
+def test_complex_overfit_uses_completed_gated_v1_1_provenance(
+    tmp_path: Path
+) -> None:
+    runner = load_runner()
+    project_root = tmp_path / "project"
+    old_dir = project_root / "outputs/local_global_residual_mamba_v1"
+    old_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [{"session": "626", "model": "local_global_residual_mamba", "seed": 0}]
+    ).to_csv(old_dir / "overfitting_comparison.csv", index=False)
+
+    formal_run_dir = _completed_gated_v1_1(project_root)
+    mamba_rows = [
+        {
+            "session": session,
+            "model": model,
+            "seed": seed,
+            "possible_severe_overfit": False,
+        }
+        for session in runner.EXPECTED_SESSIONS
+        for model in ("spatial_mamba", "local_global_residual_mamba")
+        for seed in runner.SEEDS
+    ]
+    formal_overfit = formal_run_dir / "overfitting_comparison.csv"
+    pd.DataFrame(mamba_rows).to_csv(formal_overfit, index=False)
+    transformer_path = (
+        project_root
+        / "outputs/transformer_visual_binary_v1/overfitting_summary.csv"
+    )
+    transformer_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "session": session,
+                "model": "cnn_factorized_transformer",
+                "seed": seed,
+                "possible_severe_overfit": False,
+            }
+            for session in runner.EXPECTED_SESSIONS
+            for seed in runner.SEEDS
+        ]
+    ).to_csv(transformer_path, index=False)
+
+    frame = runner.load_complex_overfit(SimpleNamespace(project_root=project_root))
+    gated_and_spatial = frame[
+        frame["model"].isin(["spatial_mamba", "local_global_residual_mamba"])
+    ]
+    assert set(gated_and_spatial["source"]) == {str(formal_overfit)}
+    assert set(gated_and_spatial["source_run_status"]) == {"complete"}

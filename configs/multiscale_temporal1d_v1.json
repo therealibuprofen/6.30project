@@ -64,6 +64,16 @@
     "spatial_mamba",
     "local_global_residual_mamba"
   ],
+  "gated_mamba_formal_provenance": {
+    "run_directory": "outputs/local_global_residual_mamba_v1_1",
+    "summary": "proposed_summary.csv",
+    "overfitting": "overfitting_comparison.csv",
+    "completion_manifest": "RUN_COMPLETE.json",
+    "required_completion_status": "complete",
+    "required_model": "local_global_residual_mamba",
+    "required_sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+    "legacy_v1_automatic_fallback": false
+  },
   "success_rule": {
     "multiscale_mean_BA_above_single_scale": true,
     "non_decreasing_sessions_vs_single_scale_at_least": 6,

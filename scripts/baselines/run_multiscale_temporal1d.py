@@ -79,6 +79,10 @@ EXTERNAL_BASELINES = (
     "spatial_mamba",
     "local_global_residual_mamba",
 )
+GATED_MAMBA_FORMAL_RUN_RELATIVE = Path(
+    "outputs/local_global_residual_mamba_v1_1"
+)
+GATED_MAMBA_FORMAL_MODEL = "local_global_residual_mamba"
 DISPLAY_NAMES = {
     **MODEL_DISPLAY_NAMES,
     FORMAL_TEMPORAL_BASELINE_NAME: "Existing formal Temporal 1D-CNN",
@@ -861,6 +865,32 @@ def _first_existing(paths: list[Path], description: str) -> Path:
     return path
 
 
+def validate_gated_mamba_formal_run(
+    args: argparse.Namespace,
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve the completed v1.1 formal run without falling back to legacy v1."""
+    run_dir = args.project_root / GATED_MAMBA_FORMAL_RUN_RELATIVE
+    completion_path = run_dir / "RUN_COMPLETE.json"
+    if not completion_path.is_file():
+        raise FileNotFoundError(
+            "formal Gated Mamba v1.1 requires "
+            f"{completion_path}; legacy local_global_residual_mamba_v1 is not an "
+            "automatic fallback"
+        )
+    try:
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AssertionError(
+            f"invalid formal Gated Mamba completion manifest: {completion_path}"
+        ) from exc
+    if not isinstance(completion, dict) or completion.get("status") != "complete":
+        raise AssertionError(
+            "formal Gated Mamba v1.1 RUN_COMPLETE.json must have status='complete': "
+            f"{completion_path}"
+        )
+    return run_dir, completion
+
+
 def load_external_baselines(args: argparse.Namespace) -> pd.DataFrame:
     clean = prior_runner.load_clean4_formal_seed_records(args)
     rows = []
@@ -885,6 +915,13 @@ def load_external_baselines(args: argparse.Namespace) -> pd.DataFrame:
                     "retrained_by_this_runner": False,
                 }
             )
+    gated_run_dir, gated_completion = validate_gated_mamba_formal_run(args)
+    gated_completion_path = gated_run_dir / "RUN_COMPLETE.json"
+    gated_summary_path = gated_run_dir / "proposed_summary.csv"
+    if not gated_summary_path.is_file():
+        raise FileNotFoundError(
+            f"completed formal Gated Mamba v1.1 summary is missing: {gated_summary_path}"
+        )
     summary_specs = (
         (
             "spatial_mamba",
@@ -900,16 +937,8 @@ def load_external_baselines(args: argparse.Namespace) -> pd.DataFrame:
             "transformer_summary.csv",
         ),
         (
-            "local_global_residual_mamba",
-            _first_existing(
-                [
-                    args.project_root
-                    / "outputs/local_global_residual_mamba_v1/proposed_summary.csv",
-                    args.project_root
-                    / "outputs/local_global_residual_mamba_v1_1/proposed_summary.csv",
-                ],
-                "Gated Mamba summary",
-            ),
+            GATED_MAMBA_FORMAL_MODEL,
+            gated_summary_path,
             "proposed_summary.csv",
         ),
     )
@@ -919,6 +948,17 @@ def load_external_baselines(args: argparse.Namespace) -> pd.DataFrame:
         if not required.issubset(frame.columns):
             raise AssertionError(f"{path} lacks required formal summary columns")
         selected = frame[frame["model"].astype(str).eq(model_name)]
+        if model_name == GATED_MAMBA_FORMAL_MODEL:
+            observed_sessions = selected["session"].astype(str).tolist()
+            if (
+                len(observed_sessions) != len(EXPECTED_SESSIONS)
+                or set(observed_sessions) != set(EXPECTED_SESSIONS)
+            ):
+                raise AssertionError(
+                    "formal Gated Mamba v1.1 summary must contain exactly one row for "
+                    f"each expected session; observed={observed_sessions}, "
+                    f"expected={list(EXPECTED_SESSIONS)}"
+                )
         for row in selected.itertuples(index=False):
             rows.append(
                 {
@@ -935,6 +975,16 @@ def load_external_baselines(args: argparse.Namespace) -> pd.DataFrame:
                         else np.nan
                     ),
                     "source": str(path),
+                    "source_run_complete": (
+                        str(gated_completion_path)
+                        if model_name == GATED_MAMBA_FORMAL_MODEL
+                        else np.nan
+                    ),
+                    "source_run_status": (
+                        str(gated_completion["status"])
+                        if model_name == GATED_MAMBA_FORMAL_MODEL
+                        else np.nan
+                    ),
                     "retrained_by_this_runner": False,
                 }
             )
@@ -1021,19 +1071,21 @@ def build_overfit(history: pd.DataFrame, per_seed: pd.DataFrame) -> pd.DataFrame
 
 
 def load_complex_overfit(args: argparse.Namespace) -> pd.DataFrame:
-    mamba_path = _first_existing(
-        [
-            args.project_root
-            / "outputs/local_global_residual_mamba_v1/overfitting_comparison.csv",
-            args.project_root
-            / "outputs/local_global_residual_mamba_v1_1/overfitting_comparison.csv",
-        ],
-        "Gated/Spatial Mamba overfitting comparison",
-    )
+    gated_run_dir, gated_completion = validate_gated_mamba_formal_run(args)
+    gated_completion_path = gated_run_dir / "RUN_COMPLETE.json"
+    mamba_path = gated_run_dir / "overfitting_comparison.csv"
+    if not mamba_path.is_file():
+        raise FileNotFoundError(
+            "completed formal Gated Mamba v1.1 overfitting comparison is missing: "
+            f"{mamba_path}"
+        )
     mamba = pd.read_csv(mamba_path, dtype={"session": str})
     mamba = mamba[
         mamba["model"].isin(["spatial_mamba", "local_global_residual_mamba"])
-    ]
+    ].copy()
+    mamba["source"] = str(mamba_path)
+    mamba["source_run_complete"] = str(gated_completion_path)
+    mamba["source_run_status"] = str(gated_completion["status"])
     transformer_path = _first_existing(
         [
             args.project_root
@@ -1046,7 +1098,8 @@ def load_complex_overfit(args: argparse.Namespace) -> pd.DataFrame:
     transformer = pd.read_csv(transformer_path, dtype={"session": str})
     transformer = transformer[
         transformer["model"].astype(str).eq("cnn_factorized_transformer")
-    ]
+    ].copy()
+    transformer["source"] = str(transformer_path)
     selected = pd.concat([mamba, transformer], ignore_index=True)
     if len(selected) != len(EXPECTED_SESSIONS) * len(SEEDS) * 3:
         raise AssertionError("complex-model overfit audit is incomplete")
