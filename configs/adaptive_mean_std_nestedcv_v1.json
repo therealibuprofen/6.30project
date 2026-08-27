@@ -1,0 +1,45 @@
+{
+  "output_version": "adaptive_mean_std_nestedcv_v1",
+  "protocol_version": "adaptive_mean_std_nestedcv_v1.0.0",
+  "scientific_name": "training-only adaptive temporal-representation selection",
+  "method_class": "nested-CV model selection between two fixed decoders",
+  "development_status": "exploratory_method_development_not_independent_confirmatory_evidence",
+  "scheme": "A_full_per_seed",
+  "seeds": [0, 1, 2],
+  "seed_pairing": "outer_seed == selector_seed == candidate_inner_training_seed",
+  "candidates": ["mean_only", "mean_std"],
+  "input_protocol": "clean4_binary_presence",
+  "inner_cv": "grouped_cv_splits(outer_train_cycles,max_folds=10)",
+  "inner_normalization": "arcsinh_then_inner_train_only_all_frame_pixel_zscore",
+  "inner_score": "balanced_accuracy_on_concatenated_complete_inner_oof_predictions",
+  "selection_rule": "mean_std iff inner_BA_mean_std > inner_BA_mean_only; tie -> mean_only",
+  "fixed_training": {
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "weight_decay": 0.001,
+    "batch_size": 16,
+    "epochs": 40,
+    "loss": "cross_entropy",
+    "early_stopping": false
+  },
+  "expected_counts": {
+    "outer_folds": 82,
+    "inner_split_definitions": 722,
+    "unique_inner_training_cycle_sets": 425,
+    "logical_inner_training_jobs": 4332,
+    "unique_inner_training_jobs": 2550,
+    "locked_selections": 246,
+    "reused_selected_outer_outputs": 246,
+    "fixed_candidate_tasks": 492
+  },
+  "decision_rule": {
+    "adaptive_overall_gt_fixed_mean_only": true,
+    "adaptive_overall_ge_fixed_mean_std": true,
+    "adaptive_strong3_ge_fixed_mean_only_strong3_minus": 0.01,
+    "weak_gain_retention_fraction_at_least": 0.75,
+    "success": "supports_continue_adaptive_temporal_selection",
+    "failure": "does_not_support_adaptive_temporal_selection"
+  },
+  "automatic_next_stage": false,
+  "four_class_implemented": false
+}
