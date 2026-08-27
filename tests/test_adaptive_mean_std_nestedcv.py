@@ -374,3 +374,34 @@ def test_locked_selection_contains_required_provenance_schema() -> None:
     payload = _selection_payload()
     required = {"session", "outer_fold", "seed", "outer_train_cycle_ids", "outer_test_cycle_ids", "inner_BA_mean_only", "inner_BA_mean_std", "delta_inner_BA", "tie", "selected_variant", "selection_rule_version", "candidate_protocol_fingerprints", "split_fingerprint", "normalization_protocol_fingerprint", "inner_oof_prediction_hashes", "inner_coverage_assertion", "created_at", "selection_artifact_hash", "outer_result_read_before_selection"}
     assert required <= set(payload)
+
+
+def test_plan_resume_validates_without_overwriting_manifests(planned_output, runner) -> None:
+    protected = [
+        "config.json",
+        "task_plan.csv",
+        "split_manifest.csv",
+        "cache_manifest.csv",
+        "inner_task_manifest.csv",
+        "PLAN_COMPLETE.json",
+    ]
+    before = {
+        name: core.file_sha256(planned_output / name) for name in protected
+    }
+    args = runner.parse_args(
+        [
+            "--stage",
+            "plan",
+            "--project-root",
+            str(PROJECT_DIR),
+            "--output-dir",
+            str(planned_output),
+            "--fixed-results-dir",
+            str(FORMAL_DIR),
+            "--feasibility-dir",
+            str(FEASIBILITY_DIR),
+        ]
+    )
+    runner.run_plan(args)
+    after = {name: core.file_sha256(planned_output / name) for name in protected}
+    assert after == before

@@ -320,6 +320,79 @@ def _compare_feasibility(
         raise AssertionError("formal inner split manifest differs from feasibility artifact")
 
 
+def validate_existing_plan(
+    args: argparse.Namespace, fixed_provenance: dict[str, Any]
+) -> None:
+    """Validate an existing immutable plan; never rewrite it during resume."""
+
+    config = load_plan_config(args.output_dir, args.project_root)
+    if config.get("fixed_candidate_provenance") != fixed_provenance:
+        raise AssertionError("existing plan has different fixed-run provenance")
+    required = (
+        "PLAN_COMPLETE.json",
+        "task_plan.csv",
+        "split_manifest.csv",
+        "dataset_manifest.csv",
+        "cache_manifest.csv",
+        "inner_task_manifest.csv",
+        "fixed_provenance_pin.json",
+    )
+    missing = [name for name in required if not (args.output_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(f"existing plan is incomplete; missing {missing}")
+    completion = json.loads(
+        (args.output_dir / "PLAN_COMPLETE.json").read_text(encoding="utf-8")
+    )
+    if (
+        completion.get("status") != "complete"
+        or completion.get("protocol_fingerprint") != config["protocol_fingerprint"]
+        or int(completion.get("outer_folds", -1)) != EXPECTED_OUTER_FOLDS
+        or int(completion.get("inner_split_definitions", -1))
+        != EXPECTED_INNER_DEFINITIONS
+        or int(completion.get("unique_inner_training_cycle_sets", -1))
+        != EXPECTED_UNIQUE_TRAIN_SETS
+        or int(completion.get("logical_inner_training_jobs", -1))
+        != EXPECTED_LOGICAL_INNER_JOBS
+        or int(completion.get("unique_inner_training_jobs", -1))
+        != EXPECTED_UNIQUE_TRAINING_JOBS
+    ):
+        raise AssertionError("existing PLAN_COMPLETE metadata is invalid")
+    task_plan = pd.read_csv(args.output_dir / "task_plan.csv", dtype={"session": str})
+    split_manifest = pd.read_csv(
+        args.output_dir / "split_manifest.csv", dtype={"session": str}
+    )
+    cache = pd.read_csv(args.output_dir / "cache_manifest.csv", dtype={"session": str})
+    tasks = pd.read_csv(
+        args.output_dir / "inner_task_manifest.csv", dtype={"session": str}
+    )
+    if len(task_plan) != EXPECTED_OUTER_FOLDS or len(split_manifest) != EXPECTED_INNER_DEFINITIONS:
+        raise AssertionError("existing plan split counts are invalid")
+    if len(split_manifest[["session", "inner_train_cycle_ids"]].drop_duplicates()) != EXPECTED_UNIQUE_TRAIN_SETS:
+        raise AssertionError("existing plan unique training-set count is invalid")
+    if len(cache) != EXPECTED_UNIQUE_TRAINING_JOBS or cache["training_cache_key"].duplicated().any():
+        raise AssertionError("existing training-cache manifest is invalid")
+    if len(tasks) != EXPECTED_LOGICAL_INNER_JOBS or tasks["evaluation_cache_key"].duplicated().any():
+        raise AssertionError("existing evaluation manifest is invalid")
+    if not tasks["outer_seed"].equals(tasks["selector_seed"]):
+        raise AssertionError("existing plan violates Scheme-A seed pairing")
+    for row in cache.to_dict(orient="records"):
+        if training_cache_key(json.loads(row["training_identity_json"])) != str(
+            row["training_cache_key"]
+        ):
+            raise AssertionError("existing training-cache key is invalid")
+    for row in tasks.to_dict(orient="records"):
+        if evaluation_cache_key(json.loads(row["evaluation_identity_json"])) != str(
+            row["evaluation_cache_key"]
+        ):
+            raise AssertionError("existing evaluation-cache key is invalid")
+    pin = json.loads(
+        (args.output_dir / "fixed_provenance_pin.json").read_text(encoding="utf-8")
+    )
+    if pin != fixed_provenance:
+        raise AssertionError("existing fixed provenance pin was modified")
+    _compare_feasibility(task_plan, split_manifest, args.feasibility_dir)
+
+
 def run_plan(args: argparse.Namespace) -> None:
     # This is the only pre-selection stage allowed to inspect fixed-run manifests.
     from ultrasound_decoding.multiframe.adaptive_mean_std_outer_reuse import (
@@ -328,6 +401,31 @@ def run_plan(args: argparse.Namespace) -> None:
 
     fixed = validate_fixed_run(args.fixed_results_dir, validate_all_tasks=False)
     formal_plan = fixed.pop("task_plan")
+    if (args.output_dir / "config.json").is_file():
+        validate_existing_plan(args, fixed)
+        _write_command(args.output_dir, "plan")
+        print(
+            "PLAN RESUME VALIDATED outer=82 inner=722 unique_sets=425 "
+            "unique_jobs=2550; no plan artifact overwritten",
+            flush=True,
+        )
+        return
+    forbidden_without_config = (
+        "task_plan.csv",
+        "split_manifest.csv",
+        "cache_manifest.csv",
+        "inner_task_manifest.csv",
+        "training_cache",
+        "evaluation_cache",
+        "selections",
+    )
+    unexpected = [
+        name for name in forbidden_without_config if (args.output_dir / name).exists()
+    ]
+    if unexpected:
+        raise RuntimeError(
+            f"adaptive artifacts exist without config provenance: {unexpected}"
+        )
     outer = validate_outer_manifest(formal_plan)
     sessions = _load_sessions(args.project_root, args.data_dir)
     session_ids = {
@@ -572,6 +670,7 @@ def run_inner(args: argparse.Namespace) -> None:
     if len(cache_manifest) != EXPECTED_UNIQUE_TRAINING_JOBS or len(inner_tasks) != EXPECTED_LOGICAL_INNER_JOBS:
         raise AssertionError("planned inner counts changed")
     sessions: dict[str, Any] = {}
+    session_source_hashes: dict[str, dict[str, str]] = {}
     completed_train = completed_eval = 0
     for cache_row in cache_manifest.to_dict(orient="records"):
         identity = json.loads(cache_row["training_identity_json"])
@@ -591,7 +690,17 @@ def run_inner(args: argparse.Namespace) -> None:
                 "binary",
                 data_dir=args.data_dir or default_block_data_dir(args.project_root),
             )
+            session_source_hashes[session] = {
+                "clean4_h5": file_sha256(sessions[session].source_h5_path),
+                "metadata_csv": file_sha256(
+                    sessions[session].source_metadata_path
+                ),
+            }
         data = sessions[session]
+        if session_source_hashes[session] != identity["dataset_source_sha256"]:
+            raise AssertionError(
+                f"session {session}: dataset content hash differs from plan"
+            )
         train_ids = tuple(identity["exact_training_sample_ids"])
         train_idx = _indices_for_ids(data, train_ids)
         if set(data.groups[train_idx].tolist()) != set(identity["exact_training_cycle_ids"]):
