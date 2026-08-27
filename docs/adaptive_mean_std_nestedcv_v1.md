@@ -36,6 +36,12 @@ samples. Inner validation and outer test samples are excluded. Candidate score
 is Balanced Accuracy computed once after concatenating the complete inner OOF
 predictions; it is not the mean of fold BAs.
 
+Training-cache construction never receives validation pixels. For exact API
+compatibility with the frozen normalizer, its second tensor is `X_train[:1]`;
+the resulting dummy normalized tensor is discarded. The saved float64
+normalization statistics are still independently recomputed and checked from
+the complete inner-training tensor only.
+
 The only selection rule is:
 
 ```text
@@ -83,6 +89,13 @@ statistics, epoch history, metadata, completion marker, hashes, and strict
 state-dict loading all validate. Partial or corrupt cache entries are not
 skipped. A locked selection with changed content or hash is rejected rather
 than overwritten.
+
+Before selection, the stored protocol fingerprint and SHA-256 hashes of both
+inner manifests must match their current files. Before outer reuse, the stored
+protocol fingerprint and selection-manifest SHA-256 must match, and both the
+manifest and on-disk locked-selection count must equal 246. The dynamically
+imported formal FCNN outer validator is part of the pinned adaptive source-hash
+set.
 
 ## Expected plan
 

@@ -312,7 +312,6 @@ def test_27_incomplete_or_bad_checkpoint_is_not_a_resume_hit(tmp_path, monkeypat
         identity,
         rng.normal(size=(4, 4, 5, 7)).astype(np.float32),
         np.asarray([0, 1, 0, 1]),
-        rng.normal(size=(2, 4, 5, 7)).astype(np.float32),
         device="cpu",
         workers=0,
     )
@@ -405,3 +404,149 @@ def test_plan_resume_validates_without_overwriting_manifests(planned_output, run
     runner.run_plan(args)
     after = {name: core.file_sha256(planned_output / name) for name in protected}
     assert after == before
+
+
+def test_training_cache_uses_train_only_dummy_for_duplicated_807_set(
+    tmp_path, monkeypatch, planned_output
+) -> None:
+    split = pd.read_csv(planned_output / "split_manifest.csv", dtype={"session": str})
+    duplicate = split[
+        split["session"].eq("807")
+        & split["inner_train_cycle_ids"].eq("0,1,2,3,5,6,7,8,9,10")
+    ].sort_values("outer_fold")
+    assert duplicate[["outer_fold", "inner_val_cycle_ids", "outer_test_cycle_ids"]].to_dict(
+        orient="records"
+    ) == [
+        {"outer_fold": 3, "inner_val_cycle_ids": "11", "outer_test_cycle_ids": "4"},
+        {"outer_fold": 10, "inner_val_cycle_ids": "4", "outer_test_cycle_ids": "11"},
+    ]
+    assert "X_validation_probe" not in inspect.signature(core.train_inner_cache).parameters
+
+    rng = np.random.default_rng(807)
+    train = rng.normal(size=(4, 4, 5, 7)).astype(np.float32)
+    forbidden_cycle_4 = np.full((1, 4, 5, 7), np.nan, dtype=np.float32)
+    forbidden_cycle_11 = np.full((1, 4, 5, 7), np.inf, dtype=np.float32)
+    observed: dict[str, np.ndarray | bool] = {}
+    approved_normalizer = core.normalize_blocks_train_fold_only_with_stats
+
+    def strict_train_only_normalizer(X_train, X_second, **kwargs):
+        observed["shares_training_memory"] = np.shares_memory(X_train, X_second)
+        observed["second"] = X_second.copy()
+        assert np.isfinite(X_second).all()
+        assert not np.shares_memory(X_second, forbidden_cycle_4)
+        assert not np.shares_memory(X_second, forbidden_cycle_11)
+        return approved_normalizer(X_train, X_second, **kwargs)
+
+    monkeypatch.setattr(
+        core, "normalize_blocks_train_fold_only_with_stats", strict_train_only_normalizer
+    )
+    monkeypatch.setattr(
+        core,
+        "_train_epochs",
+        lambda *args, **kwargs: [
+            {
+                "epoch": 1,
+                "train_loss": 0.5,
+                "train_accuracy": 0.5,
+                "n_train_items": 4,
+                "batch_size": 4,
+            }
+        ],
+    )
+    core.train_inner_cache(
+        tmp_path,
+        _training_identity(),
+        train,
+        np.asarray([0, 1, 0, 1]),
+        device="cpu",
+        workers=0,
+    )
+    assert observed["shares_training_memory"] is True
+    assert np.array_equal(observed["second"], train[:1])
+
+
+def test_formal_outer_validator_is_in_adaptive_source_hash_set(runner) -> None:
+    expected = "scripts/baselines/run_fcnn_mean_std_temporal_statistics.py"
+    relative = [str(path.relative_to(PROJECT_DIR)) for path in runner.source_paths(PROJECT_DIR)]
+    assert expected in relative
+    assert runner.current_source_hashes(PROJECT_DIR)[expected] == core.file_sha256(
+        PROJECT_DIR / expected
+    )
+
+
+def test_select_enforces_inner_completion_protocol_and_manifest_hashes(
+    tmp_path, planned_output, runner
+) -> None:
+    shutil.copy2(planned_output / "config.json", tmp_path / "config.json")
+    (tmp_path / "cache_manifest.csv").write_text("cache\n", encoding="utf-8")
+    (tmp_path / "inner_task_manifest.csv").write_text("task\n", encoding="utf-8")
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    marker = {
+        "status": "complete",
+        "logical_evaluations": runner.EXPECTED_LOGICAL_INNER_JOBS,
+        "protocol_fingerprint": "wrong",
+        "cache_manifest_sha256": core.file_sha256(tmp_path / "cache_manifest.csv"),
+        "inner_task_manifest_sha256": core.file_sha256(
+            tmp_path / "inner_task_manifest.csv"
+        ),
+    }
+    marker_path = tmp_path / "INNER_COMPLETE.json"
+    args = SimpleNamespace(output_dir=tmp_path, project_root=PROJECT_DIR)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(AssertionError, match="complete inner stage"):
+        runner.run_select(args)
+
+    marker["protocol_fingerprint"] = config["protocol_fingerprint"]
+    marker["cache_manifest_sha256"] = "wrong"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(AssertionError, match="cache manifest hash mismatch"):
+        runner.run_select(args)
+
+    marker["cache_manifest_sha256"] = core.file_sha256(tmp_path / "cache_manifest.csv")
+    marker["inner_task_manifest_sha256"] = "wrong"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(AssertionError, match="inner task manifest hash mismatch"):
+        runner.run_select(args)
+
+
+def test_outer_enforces_selection_completion_protocol_hash_and_count(
+    tmp_path, planned_output, runner
+) -> None:
+    shutil.copy2(planned_output / "config.json", tmp_path / "config.json")
+    (tmp_path / "selection_manifest.csv").write_text("selection\n", encoding="utf-8")
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    marker = {
+        "status": "complete",
+        "locked_selections": runner.EXPECTED_SELECTIONS,
+        "protocol_fingerprint": "wrong",
+        "selection_manifest_sha256": core.file_sha256(
+            tmp_path / "selection_manifest.csv"
+        ),
+    }
+    marker_path = tmp_path / "SELECTION_COMPLETE.json"
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        project_root=PROJECT_DIR,
+        fixed_results_dir=FORMAL_DIR,
+    )
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(PermissionError, match="246 locked selections"):
+        runner.run_outer(args)
+
+    marker["protocol_fingerprint"] = config["protocol_fingerprint"]
+    marker["selection_manifest_sha256"] = "wrong"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(PermissionError, match="selection manifest hash mismatch"):
+        runner.run_outer(args)
+
+    marker["selection_manifest_sha256"] = core.file_sha256(
+        tmp_path / "selection_manifest.csv"
+    )
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(PermissionError, match="exactly 246 locked selections"):
+        runner.run_outer(args)
+
+    marker["locked_selections"] = runner.EXPECTED_SELECTIONS - 1
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(PermissionError, match="246 locked selections"):
+        runner.run_outer(args)

@@ -147,6 +147,7 @@ def frozen_training_config(batch_size: int = FORMAL_BATCH_SIZE) -> DeepTrainingC
 def source_paths(project_root: Path) -> list[Path]:
     return [
         Path(__file__).resolve(),
+        project_root / "scripts/baselines/run_fcnn_mean_std_temporal_statistics.py",
         project_root / "src/ultrasound_decoding/multiframe/adaptive_mean_std_nestedcv.py",
         project_root / "src/ultrasound_decoding/multiframe/adaptive_mean_std_outer_reuse.py",
         project_root / "src/ultrasound_decoding/multiframe/fcnn_temporal_statistics.py",
@@ -705,15 +706,12 @@ def run_inner(args: argparse.Namespace) -> None:
         train_idx = _indices_for_ids(data, train_ids)
         if set(data.groups[train_idx].tolist()) != set(identity["exact_training_cycle_ids"]):
             raise AssertionError("runtime training cycles differ from cache identity")
-        first_eval = json.loads(group.iloc[0]["evaluation_identity_json"])
-        probe_idx = _indices_for_ids(data, tuple(first_eval["exact_validation_sample_ids"]))
         if not valid:
             train_inner_cache(
                 cache_dir,
                 identity,
                 data.X[train_idx],
                 data.y[train_idx],
-                data.X[probe_idx],
                 device=args.device,
                 workers=args.workers,
             )
@@ -789,9 +787,25 @@ def run_select(args: argparse.Namespace) -> None:
     # This function accepts no fixed-results path and cannot import outer results.
     config = load_plan_config(args.output_dir, args.project_root)
     inner_complete = json.loads((args.output_dir / "INNER_COMPLETE.json").read_text(encoding="utf-8"))
-    if inner_complete.get("status") != "complete" or int(inner_complete.get("logical_evaluations", -1)) != EXPECTED_LOGICAL_INNER_JOBS:
+    if (
+        inner_complete.get("status") != "complete"
+        or int(inner_complete.get("logical_evaluations", -1))
+        != EXPECTED_LOGICAL_INNER_JOBS
+        or inner_complete.get("protocol_fingerprint")
+        != config["protocol_fingerprint"]
+    ):
         raise AssertionError("selection requires a complete inner stage")
-    tasks = pd.read_csv(args.output_dir / "inner_task_manifest.csv", dtype={"session": str})
+    cache_manifest_path = args.output_dir / "cache_manifest.csv"
+    inner_task_manifest_path = args.output_dir / "inner_task_manifest.csv"
+    if inner_complete.get("cache_manifest_sha256") != file_sha256(
+        cache_manifest_path
+    ):
+        raise AssertionError("INNER_COMPLETE cache manifest hash mismatch")
+    if inner_complete.get("inner_task_manifest_sha256") != file_sha256(
+        inner_task_manifest_path
+    ):
+        raise AssertionError("INNER_COMPLETE inner task manifest hash mismatch")
+    tasks = pd.read_csv(inner_task_manifest_path, dtype={"session": str})
     if len(tasks) != EXPECTED_LOGICAL_INNER_JOBS or not tasks["status"].eq("complete").all():
         raise AssertionError("selection requires all inner tasks")
     all_predictions: list[pd.DataFrame] = []
@@ -925,8 +939,23 @@ def run_select(args: argparse.Namespace) -> None:
 def run_outer(args: argparse.Namespace) -> None:
     config = load_plan_config(args.output_dir, args.project_root)
     selection_complete = json.loads((args.output_dir / "SELECTION_COMPLETE.json").read_text(encoding="utf-8"))
-    if selection_complete.get("status") != "complete" or int(selection_complete.get("locked_selections", -1)) != EXPECTED_SELECTIONS:
+    if (
+        selection_complete.get("status") != "complete"
+        or int(selection_complete.get("locked_selections", -1))
+        != EXPECTED_SELECTIONS
+        or selection_complete.get("protocol_fingerprint")
+        != config["protocol_fingerprint"]
+    ):
         raise PermissionError("outer stage requires all 246 locked selections")
+    selection_manifest_path = args.output_dir / "selection_manifest.csv"
+    if selection_complete.get("selection_manifest_sha256") != file_sha256(
+        selection_manifest_path
+    ):
+        raise PermissionError("SELECTION_COMPLETE selection manifest hash mismatch")
+    selection_manifest = pd.read_csv(selection_manifest_path, dtype={"session": str})
+    locked_paths = sorted((args.output_dir / "selections").glob("session_*/*.json"))
+    if len(selection_manifest) != EXPECTED_SELECTIONS or len(locked_paths) != EXPECTED_SELECTIONS:
+        raise PermissionError("outer stage requires exactly 246 locked selections")
     # Deliberate local import: inner/select never load this capability.
     from ultrasound_decoding.multiframe.adaptive_mean_std_outer_reuse import (
         SelectedOuterResultReader,
@@ -937,7 +966,7 @@ def run_outer(args: argparse.Namespace) -> None:
     fixed_plan = fixed.pop("task_plan")
     results: list[dict[str, Any]] = []
     predictions: list[pd.DataFrame] = []
-    for path in sorted((args.output_dir / "selections").glob("session_*/*.json")):
+    for path in locked_paths:
         selection = read_locked_selection(path, expected_protocol_fingerprint=config["protocol_fingerprint"])
         reader = SelectedOuterResultReader(
             args.fixed_results_dir,

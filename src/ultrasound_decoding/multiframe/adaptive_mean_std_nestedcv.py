@@ -444,29 +444,36 @@ def train_inner_cache(
     identity: Mapping[str, Any],
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_validation_probe: np.ndarray,
     *,
     device: str,
     workers: int,
 ) -> None:
-    """Train one unique inner model using only its declared training samples."""
+    """Train one unique inner model using only its declared training samples.
+
+    The approved normalizer accepts two tensors, but cache construction must not
+    inspect a parent-specific validation tensor: a reused training set can have
+    different validation cycles, including another parent's outer-test cycle.
+    A one-sample training-only dummy preserves the normalizer's exact training
+    transform while keeping pre-selection training isolated from all held-out
+    pixels.
+    """
 
     candidate = str(identity["candidate"])
     seed = int(identity["seed"])
     config = DeepTrainingConfig(**dict(identity["training"]))
     set_reproducible_seed(seed)
     torch_device = resolve_device(device)
-    train_norm, _probe_norm, audit, mean32, std32 = (
+    train_norm, _unused_train_dummy_norm, audit, mean32, std32 = (
         normalize_blocks_train_fold_only_with_stats(
             X_train,
-            X_validation_probe,
+            X_train[:1],
             session=str(identity["session"]),
             task="binary",
             method=candidate,
             seed=seed,
             fold=0,
             train_cycles=ids_text(identity["exact_training_cycle_ids"]),
-            test_cycles="inner_validation_probe",
+            test_cycles="inner_train_only_dummy",
         )
     )
     audit["phase"] = "inner_train_fold_only"
