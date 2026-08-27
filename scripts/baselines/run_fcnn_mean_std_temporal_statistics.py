@@ -43,6 +43,7 @@ from ultrasound_decoding.multiframe.fcnn_temporal_statistics import (
     MEAN_ONLY_VARIANT,
     MEAN_STD_VARIANT,
     MODEL_IMPLEMENTATION_VERSION,
+    MODEL_NAME,
     STD_CORRECTION,
     architecture_config,
     parameter_audit,
@@ -568,6 +569,20 @@ def _task_hashes(path: Path) -> dict[str, str]:
     return {name: framework.file_sha256(path / name) for name in REQUIRED_TASK_FILES}
 
 
+def validate_result_model_provenance(
+    result: dict[str, Any], expected_variant: str
+) -> tuple[bool, str]:
+    """Validate experiment-level model lineage and the paired variant label."""
+
+    if expected_variant not in INPUT_VARIANTS:
+        return False, f"unknown expected variant {expected_variant!r}"
+    if result.get("model") != MODEL_NAME:
+        return False, "result model identifier mismatch"
+    if result.get("variant") != expected_variant:
+        return False, "result variant identifier mismatch"
+    return True, "validated"
+
+
 def validate_completed_task(
     path: Path,
     expected: dict[str, Any],
@@ -633,6 +648,11 @@ def validate_completed_task(
     )
     if observed != identity:
         return fail("result identity mismatch")
+    model_provenance_valid, model_provenance_reason = (
+        validate_result_model_provenance(result, variant)
+    )
+    if not model_provenance_valid:
+        return fail(model_provenance_reason)
     expected_parameters = parameter_audit()[
         f"{variant}_trainable_parameters"
     ]
@@ -926,7 +946,7 @@ def write_fold_task(
         "variant": variant,
         "seed": seed,
         "fold": fold,
-        "model": "fcnn_meanpool",
+        "model": MODEL_NAME,
         "model_implementation_version": MODEL_IMPLEMENTATION_VERSION,
         "train_cycles": observed_train_cycles,
         "test_cycles": observed_test_cycles,

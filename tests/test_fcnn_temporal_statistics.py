@@ -330,6 +330,30 @@ def test_corrupt_or_missing_task_is_not_resume_complete(tmp_path: Path) -> None:
     assert "missing files" in reason
 
 
+def test_resume_model_provenance_requires_experiment_model_and_exact_variant() -> None:
+    runner = load_runner()
+    valid, reason = runner.validate_result_model_provenance(
+        {"model": runner.MODEL_NAME, "variant": MEAN_STD_VARIANT},
+        MEAN_STD_VARIANT,
+    )
+    assert valid is True
+    assert reason == "validated"
+
+    valid, reason = runner.validate_result_model_provenance(
+        {"model": "fcnn_meanpool", "variant": MEAN_STD_VARIANT},
+        MEAN_STD_VARIANT,
+    )
+    assert valid is False
+    assert reason == "result model identifier mismatch"
+
+    valid, reason = runner.validate_result_model_provenance(
+        {"model": runner.MODEL_NAME, "variant": MEAN_ONLY_VARIANT},
+        MEAN_STD_VARIANT,
+    )
+    assert valid is False
+    assert reason == "result variant identifier mismatch"
+
+
 def test_decision_rule_uses_exact_sign_flip_and_registered_label() -> None:
     runner = load_runner()
     rows = []
