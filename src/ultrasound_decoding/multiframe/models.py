@@ -262,10 +262,19 @@ class CNN2DTemporal1D(_SharedEncoderSequenceClassifier):
         )
         self.classifier = nn.Sequential(nn.Dropout(float(dropout)), nn.Linear(64, n_classes))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_with_embedding(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return binary logits and the unchanged classifier-input embedding."""
+
         z = self.encode_sequence(x)
         z_time = z.transpose(1, 2)
-        return self.classifier(self.temporal_conv(z_time))
+        embedding = self.temporal_conv(z_time)
+        return self.classifier(embedding), embedding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits, _embedding = self.forward_with_embedding(x)
+        return logits
 
 
 class _SharedFCNNSequenceClassifier(nn.Module):
