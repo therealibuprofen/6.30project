@@ -1,0 +1,58 @@
+{
+  "output_version": "fcnn_canonical_single_frame_v1",
+  "model": "fcnn_canonical_single_frame",
+  "scientific_name": "Canonical-midpoint single-frame FCNN with frame-wise clean4 training",
+  "task": "binary_presence",
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "seeds": [0, 1, 2],
+  "expected_folds": 82,
+  "expected_tasks": 246,
+  "expected_test_block_forwards": 1368,
+  "expected_train_diagnostic_block_forwards": 11640,
+  "expected_total_block_forwards": 13008,
+  "device": "cpu_only",
+  "training_performed": false,
+  "checkpoint": {
+    "method": "fcnn_late_fusion",
+    "base_model": "official_single_frame_FCNN",
+    "parameters": 48011,
+    "final_epoch": 40,
+    "training_unit": "each clean4 frame is an independent supervised sample"
+  },
+  "canonical_frame": {
+    "formula": "argmin_k(abs(clean4_relative_time_s[k] - 15.0))",
+    "midpoint_s": 15.0,
+    "tie_break": "earlier_timestamp",
+    "dynamic_from_saved_timestamps": true,
+    "position_search": false
+  },
+  "normalization": {
+    "transform": "arcsinh_then_train_pixel_zscore",
+    "statistics": "checkpoint_saved_outer_train_fold_mean_std",
+    "refit": false,
+    "test_used_for_fit": false
+  },
+  "inference": {
+    "model_eval": true,
+    "torch_no_grad": true,
+    "frames_per_block_forwarded": 1,
+    "probability_average": false,
+    "logit_average": false,
+    "majority_vote": false,
+    "temporal_mean": false,
+    "temporal_std": false,
+    "fusion": false
+  },
+  "evaluation": {
+    "unit": "block",
+    "predictions_per_held_out_block": 1,
+    "metric": "OOF Balanced Accuracy",
+    "aggregation": "concatenate outer-held-out block predictions within session and seed before scoring"
+  },
+  "comparators": [
+    "historical_fcnn_late_fusion",
+    "current_fcnn_bottleneck_mean_only"
+  ],
+  "statistics": "exact_two_sided_paired_sign_flip_over_9_session_deltas",
+  "formal_full_locked_until_review_approved": true
+}
