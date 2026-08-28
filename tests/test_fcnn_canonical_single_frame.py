@@ -310,6 +310,14 @@ def test_historical_late_fusion_probability_mismatch_stops_summary() -> None:
         runner.require_late_fusion_reconstruction_pass(summary)
 
 
+def test_reconstructed_sample_i_uses_session_source_index_not_fold_local_row() -> None:
+    runner = load_runner()
+    source = inspect.getsource(runner.infer_task)
+    assert '"sample_i": test_source_indices' in source
+    sanity_source = inspect.getsource(runner.run_sanity)
+    assert '"sample_i": sample_indices' in sanity_source
+
+
 def test_meanpool_sample_or_truth_mismatch_stops() -> None:
     runner = load_runner()
     canonical = pd.DataFrame(

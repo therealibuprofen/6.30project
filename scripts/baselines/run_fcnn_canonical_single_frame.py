@@ -1226,7 +1226,9 @@ def infer_task(
             "session": session,
             "seed": seed,
             "fold": fold,
-            "sample_i": np.arange(len(test_truth), dtype=np.int64),
+            # Historical aggregate `sample_i` is the session-level block/source
+            # index, not a fold-local row number.
+            "sample_i": test_source_indices,
             "source_index": test_source_indices,
             "block_id": test_meta["block_id"].astype(str),
             "cycle": data.groups[test_mask].astype(np.int64),
@@ -1625,7 +1627,7 @@ def run_sanity(args: argparse.Namespace) -> None:
                 "session": session,
                 "seed": int(expected.seed),
                 "fold": int(expected.fold),
-                "sample_i": np.arange(len(sample_indices), dtype=np.int64),
+                "sample_i": sample_indices,
                 "block_id": meta["block_id"].astype(str),
                 "cycle": data.groups[sample_indices].astype(np.int64),
                 "block_name": meta["block_name"].astype(str),
