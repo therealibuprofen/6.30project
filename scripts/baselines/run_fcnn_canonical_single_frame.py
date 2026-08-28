@@ -40,6 +40,7 @@ from ultrasound_decoding.multiframe.canonical_single_frame import (
     file_sha256,
     load_validated_checkpoint,
     predict_single_frame_probabilities,
+    reconstruct_late_fusion_probabilities,
     select_canonical_frames,
     select_canonical_positions,
 )
@@ -59,8 +60,19 @@ EXPECTED_TASKS = 246
 EXPECTED_BLOCKS = 456
 EXPECTED_TEST_FORWARDS = EXPECTED_BLOCKS * len(SEEDS)
 EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS = 11_640
-EXPECTED_TOTAL_FORWARDS = (
+EXPECTED_CANONICAL_TOTAL_FORWARDS = (
     EXPECTED_TEST_FORWARDS + EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS
+)
+EXPECTED_LATE_FUSION_FRAME_FORWARDS = 4 * EXPECTED_TEST_FORWARDS
+EXPECTED_TOTAL_FRAME_FORWARDS = (
+    EXPECTED_CANONICAL_TOTAL_FORWARDS + EXPECTED_LATE_FUSION_FRAME_FORWARDS
+)
+LATE_FUSION_PROBABILITY_ATOL = 2e-6
+LATE_FUSION_PROBABILITY_RTOL = 1e-6
+MEANPOOL_OUTPUT_VERSION = "fcnn_mean_std_temporal_statistics_v1"
+MEANPOOL_MODEL_NAME = "fcnn_bottleneck_temporal_statistics"
+MEANPOOL_MODEL_IMPLEMENTATION_VERSION = (
+    "fcnn_mean_std_temporal_statistics_v1.0.0"
 )
 STRONG_SESSIONS = ("708", "709", "710")
 WEAK_SESSIONS = tuple(
@@ -74,6 +86,9 @@ REQUIRED_FINAL_OUTPUTS = (
     "normalization_audit.csv",
     "canonical_frame_manifest.csv",
     "predictions.csv",
+    "late_fusion_reconstructed_predictions.csv",
+    "late_fusion_reconstruction_audit.csv",
+    "late_fusion_reconstruction_audit.json",
     "fold_summary.csv",
     "session_seed_summary.csv",
     "session_summary.csv",
@@ -166,6 +181,7 @@ def source_paths(project_root: Path) -> list[Path]:
         project_root / "docs/fcnn_canonical_single_frame_v1.md",
         project_root
         / "scripts/baselines/run_fcnn_mean_std_temporal_statistics.py",
+        project_root / "scripts/baselines/run_multiscale_temporal1d.py",
     ]
 
 
@@ -190,7 +206,11 @@ def experiment_config(args: argparse.Namespace) -> dict[str, Any]:
         "expected_train_diagnostic_block_forwards": (
             EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS
         ),
-        "expected_total_block_forwards": EXPECTED_TOTAL_FORWARDS,
+        "expected_canonical_block_forwards": EXPECTED_CANONICAL_TOTAL_FORWARDS,
+        "expected_late_fusion_verification_frame_forwards": (
+            EXPECTED_LATE_FUSION_FRAME_FORWARDS
+        ),
+        "expected_total_model_frame_forwards": EXPECTED_TOTAL_FRAME_FORWARDS,
         "device": "cpu_only",
         "training_performed": False,
         "weights_updated": False,
@@ -215,9 +235,14 @@ def experiment_config(args: argparse.Namespace) -> dict[str, Any]:
             "fit_or_recomputed_for_inference": False,
             "test_used_for_fit": False,
         },
-        "inference": (
+        "canonical_inference": (
             "one canonical frame -> historical FCNN -> one probability vector; "
             "no logit/probability averaging, vote, temporal mean/std, or fusion"
+        ),
+        "late_fusion_verification": (
+            "same checkpoint and saved normalization -> independently forward all "
+            "four clean4 frames -> softmax per frame -> arithmetic mean of four "
+            "probability vectors; must match the historical aggregate"
         ),
         "evaluation_unit": "one held-out block equals one prediction",
         "oof_aggregation": (
@@ -229,7 +254,10 @@ def experiment_config(args: argparse.Namespace) -> dict[str, Any]:
             "historical frame-wise training objective accuracy"
         ),
         "comparators": {
-            "late_fusion": "historical fcnn_late_fusion OOF block predictions",
+            "late_fusion": (
+                "same-checkpoint reconstructed fcnn_late_fusion OOF predictions; "
+                "historical aggregate retained as a validated external reference"
+            ),
             "meanpool": (
                 "current fcnn_mean_std_temporal_statistics_v1 mean_only OOF block predictions"
             ),
@@ -386,7 +414,11 @@ def write_plan(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             "expected_train_diagnostic_block_forwards": (
                 EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS
             ),
-            "expected_total_block_forwards": EXPECTED_TOTAL_FORWARDS,
+            "expected_canonical_block_forwards": EXPECTED_CANONICAL_TOTAL_FORWARDS,
+            "expected_late_fusion_verification_frame_forwards": (
+                EXPECTED_LATE_FUSION_FRAME_FORWARDS
+            ),
+            "expected_total_model_frame_forwards": EXPECTED_TOTAL_FRAME_FORWARDS,
             "task_plan_sha256": file_sha256(args.output_dir / "task_plan.csv"),
             "canonical_frame_manifest_sha256": file_sha256(
                 args.output_dir / "canonical_frame_manifest.csv"
@@ -396,8 +428,9 @@ def write_plan(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     print(
         f"PLAN COMPLETE tasks={len(plan)} folds={EXPECTED_FOLDS} "
-        f"canonical_blocks={len(canonical)} total_block_forwards="
-        f"{EXPECTED_TOTAL_FORWARDS} training_started=False",
+        f"canonical_blocks={len(canonical)} canonical_block_forwards="
+        f"{EXPECTED_CANONICAL_TOTAL_FORWARDS} late_fusion_verification_frames="
+        f"{EXPECTED_LATE_FUSION_FRAME_FORWARDS} training_started=False",
         flush=True,
     )
     return plan, canonical
@@ -408,7 +441,7 @@ def run_plan(args: argparse.Namespace) -> None:
 
     plan, _canonical = write_plan(args)
     checkpoint_manifest = validate_all_checkpoints(args, plan)
-    late_predictions = validate_late_fusion_reference(args, plan)
+    historical_late_predictions = validate_late_fusion_reference(args, plan)
     meanpool_predictions, meanpool_provenance = validate_meanpool_reference(
         args, plan
     )
@@ -424,7 +457,9 @@ def run_plan(args: argparse.Namespace) -> None:
             "checkpoint_manifest_sha256": file_sha256(
                 args.output_dir / "checkpoint_manifest.csv"
             ),
-            "historical_late_fusion_oof_rows": int(len(late_predictions)),
+            "historical_late_fusion_oof_rows": int(
+                len(historical_late_predictions)
+            ),
             "current_meanpool_oof_rows": int(len(meanpool_predictions)),
             "comparator_provenance_validation_complete": True,
             "meanpool_run_fingerprint": meanpool_provenance["run_fingerprint"],
@@ -604,22 +639,245 @@ def validate_late_fusion_reference(
     return predictions
 
 
+def build_late_fusion_reconstruction_audit(
+    reconstructed: pd.DataFrame,
+    historical: pd.DataFrame,
+    *,
+    expected_blocks: int = EXPECTED_TEST_FORWARDS,
+    expected_tasks: int = EXPECTED_TASKS,
+    probability_atol: float = LATE_FUSION_PROBABILITY_ATOL,
+    probability_rtol: float = LATE_FUSION_PROBABILITY_RTOL,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Compare same-checkpoint late fusion against the formal aggregate."""
+
+    required = {
+        "session",
+        "seed",
+        "fold",
+        "sample_i",
+        "block_id",
+        "cycle",
+        "block_name",
+        "truth",
+        "pred",
+        "prob_no_stimulus",
+        "prob_stimulus",
+    }
+    for name, frame in (("reconstructed", reconstructed), ("historical", historical)):
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise AssertionError(f"{name} late-fusion predictions lack {missing}")
+    reconstructed = reconstructed[list(required)].copy()
+    historical = historical[list(required)].copy()
+    for frame in (reconstructed, historical):
+        frame["session"] = frame["session"].astype(str)
+        for column in ("seed", "fold", "sample_i", "cycle", "truth", "pred"):
+            frame[column] = pd.to_numeric(frame[column]).astype(int)
+        frame["block_id"] = frame["block_id"].astype(str)
+        frame["block_name"] = frame["block_name"].astype(str)
+    key_columns = ["session", "seed", "fold", "block_id"]
+    if reconstructed[key_columns].duplicated().any():
+        raise AssertionError("reconstructed late-fusion block identity is duplicated")
+    if historical[key_columns].duplicated().any():
+        raise AssertionError("historical late-fusion block identity is duplicated")
+    task_keys = sorted(
+        set(
+            map(
+                tuple,
+                pd.concat(
+                    [
+                        reconstructed[["session", "seed", "fold"]],
+                        historical[["session", "seed", "fold"]],
+                    ],
+                    ignore_index=True,
+                )
+                .drop_duplicates()
+                .itertuples(index=False, name=None),
+            )
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    maximum_probability_difference = 0.0
+    total_probability_mismatches = 0
+    total_prediction_mismatches = 0
+    total_truth_mismatches = 0
+    total_identity_mismatches = 0
+    for session, seed, fold in task_keys:
+        reconstructed_task = reconstructed[
+            reconstructed["session"].eq(str(session))
+            & reconstructed["seed"].eq(int(seed))
+            & reconstructed["fold"].eq(int(fold))
+        ]
+        historical_task = historical[
+            historical["session"].eq(str(session))
+            & historical["seed"].eq(int(seed))
+            & historical["fold"].eq(int(fold))
+        ]
+        merged = reconstructed_task.merge(
+            historical_task,
+            on=key_columns,
+            how="outer",
+            suffixes=("_reconstructed", "_historical"),
+            indicator=True,
+            validate="one_to_one",
+        )
+        missing_identity = int((~merged["_merge"].eq("both")).sum())
+        matched = merged[merged["_merge"].eq("both")].copy()
+        metadata_mismatches = int(
+            (
+                (matched["sample_i_reconstructed"] != matched["sample_i_historical"])
+                | (matched["cycle_reconstructed"] != matched["cycle_historical"])
+                | (
+                    matched["block_name_reconstructed"]
+                    != matched["block_name_historical"]
+                )
+            ).sum()
+        )
+        truth_mismatches = int(
+            (matched["truth_reconstructed"] != matched["truth_historical"]).sum()
+        )
+        prediction_mismatches = int(
+            (matched["pred_reconstructed"] != matched["pred_historical"]).sum()
+        )
+        reconstructed_probability = matched[
+            ["prob_no_stimulus_reconstructed", "prob_stimulus_reconstructed"]
+        ].to_numpy(float)
+        historical_probability = matched[
+            ["prob_no_stimulus_historical", "prob_stimulus_historical"]
+        ].to_numpy(float)
+        absolute_difference = np.abs(
+            reconstructed_probability - historical_probability
+        )
+        max_difference = (
+            float(absolute_difference.max()) if absolute_difference.size else 0.0
+        )
+        probability_mismatches = int(
+            (~np.isclose(
+                reconstructed_probability,
+                historical_probability,
+                rtol=float(probability_rtol),
+                atol=float(probability_atol),
+            )).sum()
+        )
+        passed = bool(
+            len(reconstructed_task) == len(historical_task)
+            and missing_identity == 0
+            and metadata_mismatches == 0
+            and truth_mismatches == 0
+            and prediction_mismatches == 0
+            and probability_mismatches == 0
+        )
+        rows.append(
+            {
+                "session": str(session),
+                "seed": int(seed),
+                "fold": int(fold),
+                "reconstructed_blocks": int(len(reconstructed_task)),
+                "historical_blocks": int(len(historical_task)),
+                "matched_blocks": int(len(matched)),
+                "identity_mismatches": missing_identity + metadata_mismatches,
+                "truth_mismatches": truth_mismatches,
+                "probability_value_mismatches": probability_mismatches,
+                "prediction_mismatches": prediction_mismatches,
+                "maximum_probability_absolute_difference": max_difference,
+                "probability_atol": float(probability_atol),
+                "probability_rtol": float(probability_rtol),
+                "status": "PASS" if passed else "FAIL",
+            }
+        )
+        maximum_probability_difference = max(
+            maximum_probability_difference, max_difference
+        )
+        total_probability_mismatches += probability_mismatches
+        total_prediction_mismatches += prediction_mismatches
+        total_truth_mismatches += truth_mismatches
+        total_identity_mismatches += missing_identity + metadata_mismatches
+    audit = pd.DataFrame(rows).sort_values(["session", "seed", "fold"])
+    session_seed_ba_differences: list[float] = []
+    if (
+        len(reconstructed) == len(historical)
+        and total_identity_mismatches == 0
+        and total_truth_mismatches == 0
+    ):
+        aligned = reconstructed.merge(
+            historical,
+            on=key_columns,
+            suffixes=("_reconstructed", "_historical"),
+            validate="one_to_one",
+        )
+        for _key, group in aligned.groupby(["session", "seed"], sort=True):
+            reconstructed_ba = balanced_accuracy(
+                group["truth_reconstructed"].to_numpy(int),
+                group["pred_reconstructed"].to_numpy(int),
+            )
+            historical_ba = balanced_accuracy(
+                group["truth_historical"].to_numpy(int),
+                group["pred_historical"].to_numpy(int),
+            )
+            session_seed_ba_differences.append(
+                abs(reconstructed_ba - historical_ba)
+            )
+    maximum_ba_difference = (
+        max(session_seed_ba_differences)
+        if session_seed_ba_differences
+        else float("inf")
+    )
+    passed = bool(
+        len(reconstructed) == expected_blocks
+        and len(historical) == expected_blocks
+        and len(audit) == expected_tasks
+        and audit["status"].eq("PASS").all()
+        and total_identity_mismatches == 0
+        and total_truth_mismatches == 0
+        and total_probability_mismatches == 0
+        and total_prediction_mismatches == 0
+        and maximum_ba_difference <= 1e-12
+    )
+    summary = {
+        "status": "PASS" if passed else "FAIL",
+        "reconstructed_blocks": int(len(reconstructed)),
+        "historical_blocks": int(len(historical)),
+        "expected_blocks": int(expected_blocks),
+        "audited_tasks": int(len(audit)),
+        "expected_tasks": int(expected_tasks),
+        "maximum_probability_absolute_difference": float(
+            maximum_probability_difference
+        ),
+        "probability_atol": float(probability_atol),
+        "probability_rtol": float(probability_rtol),
+        "probability_value_mismatches": int(total_probability_mismatches),
+        "prediction_mismatches": int(total_prediction_mismatches),
+        "truth_mismatches": int(total_truth_mismatches),
+        "identity_mismatches": int(total_identity_mismatches),
+        "session_seed_groups_compared": int(len(session_seed_ba_differences)),
+        "maximum_session_seed_oof_ba_difference": float(maximum_ba_difference),
+        "historical_aggregate_used_for_final_comparison": False,
+        "reconstructed_predictions_used_for_final_comparison": True,
+    }
+    return audit.reset_index(drop=True), summary
+
+
+def require_late_fusion_reconstruction_pass(summary: dict[str, Any]) -> None:
+    if summary.get("status") != "PASS":
+        raise AssertionError(
+            "same-checkpoint late-fusion reconstruction differs from the "
+            "historical formal aggregate; formal summary is blocked"
+        )
+
+
 def validate_meanpool_reference(
     args: argparse.Namespace, plan: pd.DataFrame
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     complete_path = args.meanpool_run_dir / "RUN_COMPLETE.json"
     config_path = args.meanpool_run_dir / "config.json"
+    task_plan_path = args.meanpool_run_dir / "task_plan.csv"
+    predictions_path = args.meanpool_run_dir / "predictions.csv"
     complete = json.loads(complete_path.read_text(encoding="utf-8"))
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    if (
-        complete.get("status") != "complete"
-        or int(complete.get("completed_tasks", -1)) != 492
-        or int(complete.get("total_tasks", -1)) != 492
-    ):
-        raise AssertionError("current FCNN MeanPool source is not complete 492/492")
-    predictions = pd.read_csv(
-        args.meanpool_run_dir / "predictions.csv", dtype={"session": str}
-    )
+    validate_meanpool_protocol_payloads(complete, config)
+    full_plan = pd.read_csv(task_plan_path, dtype={"session": str})
+    validate_meanpool_task_plan(full_plan, plan)
+    predictions = pd.read_csv(predictions_path, dtype={"session": str})
     predictions = predictions[predictions["variant"].eq("mean_only")].copy()
     keys = {
         (str(row.session), int(row.seed), int(row.fold))
@@ -637,14 +895,224 @@ def validate_meanpool_reference(
         raise AssertionError("current MeanPool OOF blocks are duplicated")
     if len(predictions) != EXPECTED_TEST_FORWARDS:
         raise AssertionError("current MeanPool OOF coverage differs")
+    expected_by_task = {
+        (str(row.session), int(row.seed), int(row.fold)): row
+        for row in plan.itertuples(index=False)
+    }
+    for key, group in predictions.groupby(["session", "seed", "fold"], sort=True):
+        normalized_key = (str(key[0]), int(key[1]), int(key[2]))
+        expected = expected_by_task[normalized_key]
+        expected_test_cycles = {
+            int(value) for value in str(expected.test_cycles).split(",")
+        }
+        if len(group) != int(expected.n_test_samples):
+            raise AssertionError("current MeanPool per-task sample count differs")
+        if set(group["cycle"].astype(int)) != expected_test_cycles:
+            raise AssertionError("current MeanPool test-cycle membership differs")
+        if not set(group["y_true"].astype(int)).issubset({0, 1}):
+            raise AssertionError("current MeanPool labels are not binary presence")
     return predictions, {
         "run_complete_sha256": file_sha256(complete_path),
         "config_sha256": file_sha256(config_path),
+        "task_plan_sha256": file_sha256(task_plan_path),
+        "predictions_sha256": file_sha256(predictions_path),
         "run_fingerprint": str(complete["run_fingerprint"]),
         "git_commit": str(config.get("git_commit", "")),
         "model_implementation_version": str(
             complete["model_implementation_version"]
         ),
+        "output_version": MEANPOOL_OUTPUT_VERSION,
+        "model": MEANPOOL_MODEL_NAME,
+        "variant": "mean_only",
+        "mean_only_task_coverage": EXPECTED_TASKS,
+        "mean_only_oof_block_coverage": EXPECTED_TEST_FORWARDS,
+        "protocol_validation": "passed",
+    }
+
+
+def validate_meanpool_protocol_payloads(
+    complete: dict[str, Any], config: dict[str, Any]
+) -> None:
+    """Lock the formal MeanPool scientific protocol, not only completion counts."""
+
+    experiment = config.get("experiment_config", {})
+    mean_architecture = experiment.get("architectures", {}).get("mean_only", {})
+    training = experiment.get("training", {})
+    checks = {
+        "run_status": complete.get("status") == "complete",
+        "completed_tasks": int(complete.get("completed_tasks", -1)) == 492,
+        "expected_tasks": int(complete.get("expected_tasks", -1)) == 492,
+        "total_tasks": int(complete.get("total_tasks", -1)) == 492,
+        "number_of_sessions": int(complete.get("number_of_sessions", -1)) == 9,
+        "number_of_variants": int(complete.get("number_of_variants", -1)) == 2,
+        "number_of_seeds": int(complete.get("number_of_seeds", -1)) == 3,
+        "number_of_folds": int(complete.get("number_of_folds", -1))
+        == EXPECTED_FOLDS,
+        "run_model_version": complete.get("model_implementation_version")
+        == MEANPOOL_MODEL_IMPLEMENTATION_VERSION,
+        "config_model_version": config.get("model_implementation_version")
+        == MEANPOOL_MODEL_IMPLEMENTATION_VERSION,
+        "output_version": experiment.get("output_version")
+        == MEANPOOL_OUTPUT_VERSION,
+        "task": experiment.get("task") == "binary_presence",
+        "class_mapping": experiment.get("class_mapping")
+        == {"0": "no_stimulus", "1": "stimulus"},
+        "input_protocol": experiment.get("input_protocol") == "clean4",
+        "raw_input_shape": experiment.get("raw_input_shape") == [4, 128, 501],
+        "sessions": list(experiment.get("sessions", []))
+        == list(EXPECTED_SESSIONS),
+        "seeds": list(experiment.get("seeds", [])) == list(SEEDS),
+        "variants": list(experiment.get("variants", []))
+        == ["mean_only", "mean_std"],
+        "mean_only_model": mean_architecture.get("method")
+        == MEANPOOL_MODEL_NAME,
+        "mean_only_variant": mean_architecture.get("variant") == "mean_only",
+        "mean_only_model_version": mean_architecture.get(
+            "model_implementation_version"
+        )
+        == MEANPOOL_MODEL_IMPLEMENTATION_VERSION,
+        "mean_only_temporal_length": int(
+            mean_architecture.get("temporal_length", -1)
+        )
+        == 4,
+        "mean_only_temporal_reduction": mean_architecture.get(
+            "temporal_reduction"
+        )
+        == "mean",
+        "mean_only_parameters": int(
+            mean_architecture.get("trainable_parameters", -1)
+        )
+        == EXPECTED_PARAMETERS,
+        "fixed_epoch_40": int(training.get("max_epochs", -1)) == EXPECTED_EPOCH
+        and experiment.get("epoch_selection")
+        == "fixed 40 epochs; no validation or early stopping",
+        "cycle_grouped_folds": experiment.get("cv")
+        == "exact formal clean4 cycle-grouped folds, max_folds=10",
+        "train_fold_normalization": experiment.get("normalization")
+        == "pixel z-score fit on outer-training blocks and all four real frames only",
+        "normalization_preprocessing": experiment.get("preprocessing")
+        == (
+            "clean4 -> per-frame arcsinh -> outer-train-fold all-frame "
+            "pixel z-score -> unchanged shared FCNN frame encoder -> "
+            "bottleneck temporal statistics"
+        ),
+        "no_test_normalization": not bool(
+            experiment.get("test_used_for_normalization", True)
+        ),
+        "no_test_feature_scaling": not bool(
+            experiment.get("test_used_for_feature_scaling", True)
+        ),
+        "no_test_model_selection": not bool(
+            experiment.get("test_used_for_model_selection", True)
+        ),
+        "no_test_early_stopping": not bool(
+            experiment.get("test_used_for_early_stopping", True)
+        ),
+    }
+    failures = sorted(name for name, valid in checks.items() if not valid)
+    if failures:
+        raise AssertionError(
+            "current MeanPool scientific protocol mismatch: " + ", ".join(failures)
+        )
+
+
+def validate_meanpool_task_plan(
+    full_plan: pd.DataFrame, expected_mean_only_plan: pd.DataFrame
+) -> None:
+    required = {
+        "session",
+        "variant",
+        "seed",
+        "fold",
+        "n_train_samples",
+        "n_test_samples",
+        "train_cycles",
+        "test_cycles",
+    }
+    if not required.issubset(full_plan.columns):
+        raise AssertionError("current MeanPool task plan lacks required columns")
+    if len(full_plan) != 492 or set(full_plan["variant"].astype(str)) != {
+        "mean_only",
+        "mean_std",
+    }:
+        raise AssertionError("current MeanPool task plan is not paired 492 tasks")
+    counts = full_plan.groupby("variant").size().to_dict()
+    if counts != {"mean_only": EXPECTED_TASKS, "mean_std": EXPECTED_TASKS}:
+        raise AssertionError("current MeanPool candidate task coverage differs")
+    observed = full_plan[full_plan["variant"].eq("mean_only")].copy()
+    columns = [
+        "session",
+        "seed",
+        "fold",
+        "n_train_samples",
+        "n_test_samples",
+        "train_cycles",
+        "test_cycles",
+    ]
+    observed = observed[columns].sort_values(["session", "seed", "fold"])
+    expected = expected_mean_only_plan[columns].sort_values(
+        ["session", "seed", "fold"]
+    )
+    observed = observed.reset_index(drop=True).astype(
+        {"session": str, "seed": int, "fold": int}
+    )
+    expected = expected.reset_index(drop=True).astype(
+        {"session": str, "seed": int, "fold": int}
+    )
+    if not observed.equals(expected):
+        raise AssertionError("current MeanPool task/fold membership differs")
+
+
+def validate_meanpool_sample_identity(
+    canonical_predictions: pd.DataFrame,
+    meanpool_predictions: pd.DataFrame,
+    *,
+    expected_blocks: int = EXPECTED_TEST_FORWARDS,
+    expected_session_seed_groups: int = len(EXPECTED_SESSIONS) * len(SEEDS),
+) -> dict[str, Any]:
+    """Require exact OOF sample metadata and truth alignment before comparison."""
+
+    identity = ["session", "seed", "fold", "source_index", "cycle", "block_name"]
+    required_canonical = set(identity + ["y_true"])
+    required_meanpool = set(identity + ["y_true"])
+    if not required_canonical.issubset(canonical_predictions.columns):
+        raise AssertionError("canonical predictions lack MeanPool identity columns")
+    if not required_meanpool.issubset(meanpool_predictions.columns):
+        raise AssertionError("MeanPool predictions lack identity columns")
+    canonical = canonical_predictions[identity + ["y_true"]].copy()
+    meanpool = meanpool_predictions[identity + ["y_true"]].copy()
+    for frame in (canonical, meanpool):
+        frame["session"] = frame["session"].astype(str)
+        for column in ("seed", "fold", "source_index", "cycle", "y_true"):
+            frame[column] = pd.to_numeric(frame[column]).astype(int)
+    if canonical[identity].duplicated().any() or meanpool[identity].duplicated().any():
+        raise AssertionError("canonical/MeanPool OOF identity is duplicated")
+    merged = canonical.merge(
+        meanpool,
+        on=identity,
+        how="outer",
+        suffixes=("_canonical", "_meanpool"),
+        indicator=True,
+        validate="one_to_one",
+    )
+    if len(canonical) != expected_blocks or len(meanpool) != expected_blocks:
+        raise AssertionError("canonical/MeanPool OOF coverage differs")
+    if not merged["_merge"].eq("both").all():
+        raise AssertionError("canonical and MeanPool OOF sample identities differ")
+    truth_mismatches = int(
+        (merged["y_true_canonical"] != merged["y_true_meanpool"]).sum()
+    )
+    if truth_mismatches:
+        raise AssertionError("canonical and MeanPool OOF truth labels differ")
+    group_counts = merged.groupby(["session", "seed"]).size()
+    if len(group_counts) != expected_session_seed_groups:
+        raise AssertionError("canonical/MeanPool session-seed coverage differs")
+    return {
+        "status": "PASS",
+        "matched_oof_blocks": int(len(merged)),
+        "truth_mismatches": truth_mismatches,
+        "session_seed_groups": int(len(group_counts)),
+        "identity_columns": identity,
     }
 
 
@@ -662,7 +1130,7 @@ def infer_task(
     expected: Any,
     data: Any,
     source_row: dict[str, Any],
-) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], dict[str, Any]]:
     session = str(expected.session)
     seed = int(expected.seed)
     fold = int(expected.fold)
@@ -701,14 +1169,27 @@ def infer_task(
     test_normalized = apply_saved_normalization(
         test_frames, mean, std, transform=transform
     )
+    test_blocks = np.asarray(data.X[test_mask], dtype=np.float32)
+    test_blocks_normalized = apply_saved_normalization(
+        test_blocks.reshape(-1, *EXPECTED_IMAGE_SHAPE),
+        mean,
+        std,
+        transform=transform,
+    ).reshape(test_blocks.shape)
     train_prob = predict_single_frame_probabilities(
         model, train_normalized, batch_size=args.inference_batch_size
     )
     test_prob = predict_single_frame_probabilities(
         model, test_normalized, batch_size=args.inference_batch_size
     )
+    late_fusion_prob = reconstruct_late_fusion_probabilities(
+        model,
+        test_blocks_normalized,
+        batch_size=args.inference_batch_size,
+    )
     train_pred = train_prob.argmax(axis=1).astype(np.int64)
     test_pred = test_prob.argmax(axis=1).astype(np.int64)
+    late_fusion_pred = late_fusion_prob.argmax(axis=1).astype(np.int64)
     train_truth = data.y[train_mask].astype(np.int64)
     test_truth = data.y[test_mask].astype(np.int64)
     test_meta = data.metadata.loc[test_mask].reset_index(drop=True)
@@ -740,6 +1221,26 @@ def infer_task(
         raise AssertionError("one block did not yield exactly one test prediction")
     if predictions["sample_id"].duplicated().any():
         raise AssertionError("a test block yielded multiple predictions")
+    late_fusion_predictions = pd.DataFrame(
+        {
+            "session": session,
+            "seed": seed,
+            "fold": fold,
+            "sample_i": np.arange(len(test_truth), dtype=np.int64),
+            "source_index": test_source_indices,
+            "block_id": test_meta["block_id"].astype(str),
+            "cycle": data.groups[test_mask].astype(np.int64),
+            "block_name": test_meta["block_name"].astype(str),
+            "truth": test_truth,
+            "pred": late_fusion_pred,
+            "prob_no_stimulus": late_fusion_prob[:, 0],
+            "prob_stimulus": late_fusion_prob[:, 1],
+        }
+    )
+    if len(late_fusion_predictions) != int(test_mask.sum()):
+        raise AssertionError("late-fusion reconstruction coverage differs")
+    if late_fusion_predictions["block_id"].duplicated().any():
+        raise AssertionError("late-fusion reconstruction duplicated a block")
     fold_metrics = classification_metrics(test_truth, test_pred)
     fold_result = {
         "session": session,
@@ -758,6 +1259,9 @@ def infer_task(
         "test_macro_f1": float(fold_metrics["macro_f1"]),
         "train_canonical_forward_count": int(len(train_frames)),
         "test_canonical_forward_count": int(len(test_frames)),
+        "late_fusion_verification_frame_forward_count": int(
+            4 * len(test_frames)
+        ),
         "model_eval": not model.training,
         "torch_no_grad_path": True,
         "device": "cpu",
@@ -778,10 +1282,13 @@ def infer_task(
         "std_std": float(np.asarray(std).std()),
         "n_train_canonical_frames_transformed": int(len(train_frames)),
         "n_test_canonical_frames_transformed": int(len(test_frames)),
+        "n_test_late_fusion_verification_frames_transformed": int(
+            4 * len(test_frames)
+        ),
         "train_tie_count": int(train_selection.ties.sum()),
         "test_tie_count": int(test_selection.ties.sum()),
     }
-    return predictions, fold_result, normalization_audit
+    return predictions, late_fusion_predictions, fold_result, normalization_audit
 
 
 def reference_seed_ba(
@@ -1011,7 +1518,9 @@ def build_report(
             "## Interpretation boundary",
             "",
             "Single-frame versus late fusion is the clean test-time multi-frame "
-            "inference comparison because it uses the same checkpoint. Late fusion "
+            "inference comparison because it uses the same checkpoint. The late-"
+            "fusion values in this report are reconstructed from that checkpoint "
+            "and passed the formal aggregate probability/identity audit. Late fusion "
             "versus MeanPool compares decoder strategies. Single-frame versus "
             "MeanPool is the primary overall baseline comparison, but their "
             "training units differ (frame-wise CE versus block-wise post-mean CE).",
@@ -1095,6 +1604,52 @@ def run_sanity(args: argparse.Namespace) -> None:
     probabilities = predict_single_frame_probabilities(
         model, normalized, batch_size=2
     )
+    late_fusion_sanity: dict[str, Any] = {
+        "status": "not_run_for_synthetic_sanity",
+        "frame_forwards": 0,
+    }
+    if checkpoint_used:
+        blocks = np.asarray(data.X[sample_indices], dtype=np.float32)
+        normalized_blocks = apply_saved_normalization(
+            blocks.reshape(-1, *EXPECTED_IMAGE_SHAPE),
+            mean,
+            std,
+            transform=NORMALIZATION_TRANSFORM,
+        ).reshape(blocks.shape)
+        reconstructed_probabilities = reconstruct_late_fusion_probabilities(
+            model, normalized_blocks, batch_size=2
+        )
+        meta = data.metadata.iloc[sample_indices].reset_index(drop=True)
+        reconstructed = pd.DataFrame(
+            {
+                "session": session,
+                "seed": int(expected.seed),
+                "fold": int(expected.fold),
+                "sample_i": np.arange(len(sample_indices), dtype=np.int64),
+                "block_id": meta["block_id"].astype(str),
+                "cycle": data.groups[sample_indices].astype(np.int64),
+                "block_name": meta["block_name"].astype(str),
+                "truth": data.y[sample_indices].astype(np.int64),
+                "pred": reconstructed_probabilities.argmax(axis=1),
+                "prob_no_stimulus": reconstructed_probabilities[:, 0],
+                "prob_stimulus": reconstructed_probabilities[:, 1],
+            }
+        )
+        historical = validate_late_fusion_reference(args, plan)
+        historical = historical[
+            historical["session"].astype(str).eq(session)
+            & historical["seed"].astype(int).eq(int(expected.seed))
+            & historical["fold"].astype(int).eq(int(expected.fold))
+            & historical["block_id"].astype(str).isin(
+                reconstructed["block_id"].astype(str)
+            )
+        ].copy()
+        _audit_rows, late_fusion_sanity = build_late_fusion_reconstruction_audit(
+            reconstructed,
+            historical,
+            expected_blocks=2,
+            expected_tasks=1,
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     framework.atomic_json(
         args.output_dir / "SANITY_COMPLETE.json",
@@ -1107,13 +1662,21 @@ def run_sanity(args: argparse.Namespace) -> None:
             "historical_checkpoint_used": checkpoint_used,
             "task_key": task_key,
             "n_blocks": 2,
-            "n_model_forwards": 2,
+            "canonical_frame_forwards": 2,
+            "late_fusion_verification_frame_forwards": int(
+                late_fusion_sanity["frame_forwards"]
+                if "frame_forwards" in late_fusion_sanity
+                else 8
+            ),
             "canonical_positions": selection.positions.tolist(),
             "probabilities_finite": bool(np.isfinite(probabilities).all()),
             "one_prediction_per_block": len(probabilities) == 2,
+            "late_fusion_reconstruction": late_fusion_sanity,
             "completed_utc": utc_now(),
         },
     )
+    if checkpoint_used:
+        require_late_fusion_reconstruction_pass(late_fusion_sanity)
     print(
         "SANITY COMPLETE device=cpu training_started=False "
         f"synthetic={args.synthetic_sanity}",
@@ -1131,7 +1694,7 @@ def run_full(args: argparse.Namespace) -> None:
     plan, canonical_manifest = write_plan(args)
     # Strictly validate all 246 assets before the first formal model forward.
     checkpoint_manifest = validate_all_checkpoints(args, plan)
-    late_predictions = validate_late_fusion_reference(args, plan)
+    historical_late_predictions = validate_late_fusion_reference(args, plan)
     meanpool_predictions, meanpool_provenance = validate_meanpool_reference(
         args, plan
     )
@@ -1143,6 +1706,7 @@ def run_full(args: argparse.Namespace) -> None:
         for row in checkpoint_manifest.itertuples(index=False)
     }
     prediction_frames: list[pd.DataFrame] = []
+    late_fusion_reconstruction_frames: list[pd.DataFrame] = []
     fold_rows: list[dict[str, Any]] = []
     normalization_rows: list[dict[str, Any]] = []
     for session in EXPECTED_SESSIONS:
@@ -1154,15 +1718,24 @@ def run_full(args: argparse.Namespace) -> None:
             source_row = checkpoint_lookup[
                 (session, int(expected.seed), int(expected.fold))
             ]
-            task_predictions, fold_result, normalization = infer_task(
-                args, expected, data, source_row
-            )
+            (
+                task_predictions,
+                task_late_fusion_predictions,
+                fold_result,
+                normalization,
+            ) = infer_task(args, expected, data, source_row)
             prediction_frames.append(task_predictions)
+            late_fusion_reconstruction_frames.append(
+                task_late_fusion_predictions
+            )
             fold_rows.append(fold_result)
             normalization_rows.append(normalization)
     predictions = pd.concat(prediction_frames, ignore_index=True).sort_values(
         ["session", "seed", "fold", "sample_index"]
     )
+    reconstructed_late_predictions = pd.concat(
+        late_fusion_reconstruction_frames, ignore_index=True
+    ).sort_values(["session", "seed", "fold", "sample_i"])
     fold_summary = pd.DataFrame(fold_rows).sort_values(
         ["session", "seed", "fold"]
     )
@@ -1180,8 +1753,44 @@ def run_full(args: argparse.Namespace) -> None:
         raise AssertionError("formal train diagnostic forward coverage differs")
     if predictions[["session", "seed", "sample_id"]].duplicated().any():
         raise AssertionError("a held-out block has more than one OOF prediction")
+    if len(reconstructed_late_predictions) != EXPECTED_TEST_FORWARDS:
+        raise AssertionError("reconstructed late-fusion OOF coverage differs")
+    if (
+        int(
+            fold_summary[
+                "late_fusion_verification_frame_forward_count"
+            ].sum()
+        )
+        != EXPECTED_LATE_FUSION_FRAME_FORWARDS
+    ):
+        raise AssertionError("late-fusion verification frame coverage differs")
+    late_fusion_audit, late_fusion_audit_summary = (
+        build_late_fusion_reconstruction_audit(
+            reconstructed_late_predictions, historical_late_predictions
+        )
+    )
+    framework.atomic_csv(
+        args.output_dir / "late_fusion_reconstructed_predictions.csv",
+        reconstructed_late_predictions,
+    )
+    framework.atomic_csv(
+        args.output_dir / "late_fusion_reconstruction_audit.csv",
+        late_fusion_audit,
+    )
+    framework.atomic_json(
+        args.output_dir / "late_fusion_reconstruction_audit.json",
+        late_fusion_audit_summary,
+    )
+    # Persist mismatch evidence, then block every formal summary on any drift.
+    require_late_fusion_reconstruction_pass(late_fusion_audit_summary)
+    meanpool_identity_audit = validate_meanpool_sample_identity(
+        predictions, meanpool_predictions
+    )
     seed_summary, session_summary, paired, statistical = build_summaries(
-        fold_summary, predictions, late_predictions, meanpool_predictions
+        fold_summary,
+        predictions,
+        reconstructed_late_predictions,
+        meanpool_predictions,
     )
     provenance = {
         "status": "validated",
@@ -1205,8 +1814,30 @@ def run_full(args: argparse.Namespace) -> None:
             ),
             "task_coverage": EXPECTED_TASKS,
             "same_checkpoint_as_single_frame": True,
+            "role": "externally validated provenance reference only",
+            "reconstruction_audit_status": late_fusion_audit_summary["status"],
+            "maximum_probability_absolute_difference": (
+                late_fusion_audit_summary[
+                    "maximum_probability_absolute_difference"
+                ]
+            ),
         },
-        "current_meanpool": meanpool_provenance,
+        "reconstructed_late_fusion": {
+            "prediction_sha256": file_sha256(
+                args.output_dir / "late_fusion_reconstructed_predictions.csv"
+            ),
+            "audit_csv_sha256": file_sha256(
+                args.output_dir / "late_fusion_reconstruction_audit.csv"
+            ),
+            "audit_json_sha256": file_sha256(
+                args.output_dir / "late_fusion_reconstruction_audit.json"
+            ),
+            "used_for_final_comparison": True,
+        },
+        "current_meanpool": {
+            **meanpool_provenance,
+            "canonical_sample_identity_audit": meanpool_identity_audit,
+        },
         "canonical_frame_manifest_sha256": file_sha256(
             args.output_dir / "canonical_frame_manifest.csv"
         ),
@@ -1252,11 +1883,33 @@ def run_full(args: argparse.Namespace) -> None:
             "expected_train_diagnostic_block_predictions": (
                 EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS
             ),
-            "total_block_forwards": int(
+            "canonical_block_forwards": int(
                 len(predictions)
                 + fold_summary["train_canonical_forward_count"].sum()
             ),
-            "expected_total_block_forwards": EXPECTED_TOTAL_FORWARDS,
+            "expected_canonical_block_forwards": (
+                EXPECTED_CANONICAL_TOTAL_FORWARDS
+            ),
+            "late_fusion_reconstructed_block_predictions": int(
+                len(reconstructed_late_predictions)
+            ),
+            "expected_late_fusion_reconstructed_block_predictions": (
+                EXPECTED_TEST_FORWARDS
+            ),
+            "late_fusion_verification_frame_forwards": int(
+                fold_summary[
+                    "late_fusion_verification_frame_forward_count"
+                ].sum()
+            ),
+            "expected_late_fusion_verification_frame_forwards": (
+                EXPECTED_LATE_FUSION_FRAME_FORWARDS
+            ),
+            "total_model_frame_forwards": EXPECTED_TOTAL_FRAME_FORWARDS,
+            "expected_total_model_frame_forwards": EXPECTED_TOTAL_FRAME_FORWARDS,
+            "late_fusion_reconstruction_status": late_fusion_audit_summary[
+                "status"
+            ],
+            "meanpool_sample_identity_status": meanpool_identity_audit["status"],
             "required_outputs": list(REQUIRED_FINAL_OUTPUTS),
             "completed_utc": utc_now(),
         },
@@ -1304,10 +1957,32 @@ def validate_run_complete_payload(payload: dict[str, Any]) -> bool:
         == EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS
         and int(payload.get("expected_train_diagnostic_block_predictions", -1))
         == EXPECTED_TRAIN_DIAGNOSTIC_FORWARDS
-        and int(payload.get("total_block_forwards", -1))
-        == EXPECTED_TOTAL_FORWARDS
-        and int(payload.get("expected_total_block_forwards", -1))
-        == EXPECTED_TOTAL_FORWARDS
+        and int(payload.get("canonical_block_forwards", -1))
+        == EXPECTED_CANONICAL_TOTAL_FORWARDS
+        and int(payload.get("expected_canonical_block_forwards", -1))
+        == EXPECTED_CANONICAL_TOTAL_FORWARDS
+        and int(
+            payload.get("late_fusion_reconstructed_block_predictions", -1)
+        )
+        == EXPECTED_TEST_FORWARDS
+        and int(
+            payload.get(
+                "expected_late_fusion_reconstructed_block_predictions", -1
+            )
+        )
+        == EXPECTED_TEST_FORWARDS
+        and int(payload.get("late_fusion_verification_frame_forwards", -1))
+        == EXPECTED_LATE_FUSION_FRAME_FORWARDS
+        and int(
+            payload.get("expected_late_fusion_verification_frame_forwards", -1)
+        )
+        == EXPECTED_LATE_FUSION_FRAME_FORWARDS
+        and int(payload.get("total_model_frame_forwards", -1))
+        == EXPECTED_TOTAL_FRAME_FORWARDS
+        and int(payload.get("expected_total_model_frame_forwards", -1))
+        == EXPECTED_TOTAL_FRAME_FORWARDS
+        and payload.get("late_fusion_reconstruction_status") == "PASS"
+        and payload.get("meanpool_sample_identity_status") == "PASS"
         and not bool(payload.get("training_performed", True))
         and payload.get("device") == "cpu"
     )

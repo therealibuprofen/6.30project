@@ -22,7 +22,9 @@ float32 canonical frame
 → one two-class probability vector
 ```
 
-There is no probability/logit averaging, vote, temporal mean/std, or other fusion. One held-out block produces one prediction. Session/seed OOF Balanced Accuracy is calculated only after concatenating all outer-held-out block predictions; fold BAs are diagnostic and are never averaged into the primary metric.
+The canonical path contains no probability/logit averaging, vote, temporal mean/std, or other fusion. One held-out block produces one prediction. Session/seed OOF Balanced Accuracy is calculated only after concatenating all outer-held-out block predictions; fold BAs are diagnostic and are never averaged into the primary metric.
+
+As a provenance gate, the same loaded checkpoint and saved normalization also reconstruct historical late fusion for every held-out block: all four normalized clean4 frames are forwarded independently, softmax is applied per frame, and the four probability vectors are averaged. The resulting 1,368 block probabilities, predictions, identities, truths and session/seed OOF BAs must match the formal historical aggregate (`atol=2e-6`, `rtol=1e-6`). This tight tolerance only permits float32 CPU/GPU matrix-reduction noise; predictions and metadata must match exactly. The real-checkpoint CPU sanity comparison had maximum probability difference `0.0`. The audit is saved before validation is enforced; any failure blocks all formal summaries. Final A-versus-B results use the reconstructed predictions, while the aggregate remains an external reference.
 
 ## Comparisons and interpretation
 
@@ -34,9 +36,9 @@ Recommended manuscript name: **Canonical-midpoint single-frame FCNN with frame-w
 
 ## Safety gates
 
-The formal stage requires `--review-approved`, rejects every device except CPU, and validates all 246 checkpoint hashes and payloads before the first formal forward. Any missing/mismatched task stops the entire run; there is no retraining fallback.
+The formal stage requires `--review-approved`, rejects every device except CPU, and validates all 246 checkpoint hashes and payloads before the first formal forward. It also validates the frozen MeanPool output/model protocol, clean4 binary labels, seed/fold/task coverage, epoch 40, train-fold-only normalization, implementation version and exact task membership. MeanPool `RUN_COMPLETE.json`, `config.json`, `task_plan.csv` and `predictions.csv` hashes are recorded. Canonical and MeanPool OOF identities/truths must match exactly. Any missing/mismatched task or comparator stops the entire run; there is no retraining fallback.
 
-The formal pass contains 1,368 held-out canonical-frame predictions. The optional-but-registered train-side diagnostic evaluates 11,640 outer-training block/checkpoint combinations, for 13,008 single-frame sample forwards in total. These are batched CPU inference operations, not optimizer steps.
+The formal pass contains 1,368 held-out canonical-frame predictions. The registered train-side diagnostic evaluates 11,640 outer-training block/checkpoint combinations, for 13,008 canonical/diagnostic single-frame forwards. The same-checkpoint late-fusion provenance gate adds 5,472 held-out frame forwards, producing 1,368 reconstructed block predictions. Total model frame forwards are therefore 18,480. These are batched CPU inference operations, not optimizer steps.
 
 ## Commands
 

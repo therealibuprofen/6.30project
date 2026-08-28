@@ -13,7 +13,7 @@ from ultrasound_decoding.deep import FCNN
 
 
 MODEL_NAME = "fcnn_canonical_single_frame"
-MODEL_IMPLEMENTATION_VERSION = "fcnn_canonical_single_frame_v1.0.0"
+MODEL_IMPLEMENTATION_VERSION = "fcnn_canonical_single_frame_v1.0.1"
 HISTORICAL_METHOD = "fcnn_late_fusion"
 HISTORICAL_BASE_MODEL = "official_single_frame_FCNN"
 NORMALIZATION_TRANSFORM = "arcsinh_then_train_pixel_zscore"
@@ -302,3 +302,33 @@ def predict_single_frame_probabilities(
     if not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-6):
         raise AssertionError("invalid canonical single-frame probabilities")
     return probabilities.astype(np.float32, copy=False)
+
+
+def reconstruct_late_fusion_probabilities(
+    model: nn.Module,
+    normalized_blocks: np.ndarray,
+    *,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Reproduce historical late fusion: frame softmax, then mean by block."""
+
+    blocks = np.asarray(normalized_blocks, dtype=np.float32)
+    if (
+        blocks.ndim != 4
+        or blocks.shape[1] != 4
+        or tuple(blocks.shape[-2:]) != EXPECTED_IMAGE_SHAPE
+    ):
+        raise ValueError("normalized blocks must have shape [N,4,128,501]")
+    frame_probabilities = predict_single_frame_probabilities(
+        model,
+        blocks.reshape(-1, *EXPECTED_IMAGE_SHAPE),
+        batch_size=batch_size,
+    )
+    block_probabilities = frame_probabilities.reshape(len(blocks), 4, 2).mean(
+        axis=1
+    )
+    if block_probabilities.shape != (len(blocks), 2):
+        raise AssertionError("late fusion did not yield one probability per block")
+    if not np.allclose(block_probabilities.sum(axis=1), 1.0, atol=1e-6):
+        raise AssertionError("invalid reconstructed late-fusion probabilities")
+    return block_probabilities.astype(np.float32, copy=False)

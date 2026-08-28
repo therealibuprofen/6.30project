@@ -1,6 +1,7 @@
 {
   "output_version": "fcnn_canonical_single_frame_v1",
   "model": "fcnn_canonical_single_frame",
+  "model_implementation_version": "fcnn_canonical_single_frame_v1.0.1",
   "scientific_name": "Canonical-midpoint single-frame FCNN with frame-wise clean4 training",
   "task": "binary_presence",
   "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
@@ -9,7 +10,9 @@
   "expected_tasks": 246,
   "expected_test_block_forwards": 1368,
   "expected_train_diagnostic_block_forwards": 11640,
-  "expected_total_block_forwards": 13008,
+  "expected_canonical_block_forwards": 13008,
+  "expected_late_fusion_verification_frame_forwards": 5472,
+  "expected_total_model_frame_forwards": 18480,
   "device": "cpu_only",
   "training_performed": false,
   "checkpoint": {
@@ -42,6 +45,14 @@
     "temporal_mean": false,
     "temporal_std": false,
     "fusion": false
+  },
+  "late_fusion_verification": {
+    "same_checkpoint_as_canonical": true,
+    "frames_per_block": 4,
+    "operation": "softmax each normalized frame independently then arithmetic mean of four probability vectors",
+    "historical_aggregate_role": "external provenance reference; reconstructed predictions drive the final comparison",
+    "probability_atol": 2e-06,
+    "probability_rtol": 1e-06
   },
   "evaluation": {
     "unit": "block",

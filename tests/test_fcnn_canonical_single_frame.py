@@ -21,6 +21,7 @@ from ultrasound_decoding.multiframe.canonical_single_frame import (
     apply_saved_normalization,
     count_parameters,
     predict_single_frame_probabilities,
+    reconstruct_late_fusion_probabilities,
     select_canonical_frames,
     select_canonical_positions,
     validate_checkpoint_payload,
@@ -251,6 +252,166 @@ def test_single_frame_module_has_no_late_fusion_averaging_call() -> None:
     assert "majority" not in source
 
 
+def test_reconstructed_late_fusion_matches_historical_probability_average() -> None:
+    model = ForwardAuditModel()
+    blocks = np.zeros((2, 4, *EXPECTED_IMAGE_SHAPE), dtype=np.float32)
+    scores = np.asarray([[-2.0, -1.0, 1.0, 2.0], [0.0, 0.5, 1.5, 3.0]])
+    blocks[:, :, 0, 0] = scores
+    observed = reconstruct_late_fusion_probabilities(
+        model, blocks, batch_size=3
+    )
+    logits = np.stack((-scores, scores), axis=-1)
+    exponentials = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    expected = (exponentials / exponentials.sum(axis=-1, keepdims=True)).mean(
+        axis=1
+    )
+    assert np.allclose(observed, expected, atol=1e-7, rtol=1e-7)
+
+
+def late_fusion_reference_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+    for sample_i, block_name, truth, probability in (
+        (0, "grating", 1, (0.2, 0.8)),
+        (1, "static", 0, (0.7, 0.3)),
+    ):
+        rows.append(
+            {
+                "session": "626",
+                "seed": 0,
+                "fold": 1,
+                "sample_i": sample_i,
+                "block_id": f"session626_cycle000_{block_name}",
+                "cycle": 0,
+                "block_name": block_name,
+                "truth": truth,
+                "pred": int(probability[1] > probability[0]),
+                "prob_no_stimulus": probability[0],
+                "prob_stimulus": probability[1],
+            }
+        )
+    historical = pd.DataFrame(rows)
+    reconstructed = historical.copy()
+    reconstructed["source_index"] = [0, 3]
+    return reconstructed, historical
+
+
+def test_historical_late_fusion_probability_mismatch_stops_summary() -> None:
+    runner = load_runner()
+    reconstructed, historical = late_fusion_reference_frames()
+    reconstructed.loc[0, "prob_stimulus"] += 1e-3
+    _audit, summary = runner.build_late_fusion_reconstruction_audit(
+        reconstructed,
+        historical,
+        expected_blocks=2,
+        expected_tasks=1,
+    )
+    assert summary["status"] == "FAIL"
+    with np.testing.assert_raises(AssertionError):
+        runner.require_late_fusion_reconstruction_pass(summary)
+
+
+def test_meanpool_sample_or_truth_mismatch_stops() -> None:
+    runner = load_runner()
+    canonical = pd.DataFrame(
+        {
+            "session": ["626", "626"],
+            "seed": [0, 0],
+            "fold": [1, 1],
+            "source_index": [0, 3],
+            "cycle": [0, 0],
+            "block_name": ["grating", "static"],
+            "y_true": [1, 0],
+        }
+    )
+    meanpool = canonical.copy()
+    meanpool.loc[1, "y_true"] = 1
+    with np.testing.assert_raises(AssertionError):
+        runner.validate_meanpool_sample_identity(
+            canonical,
+            meanpool,
+            expected_blocks=2,
+            expected_session_seed_groups=1,
+        )
+
+
+def valid_meanpool_protocol_payloads() -> tuple[dict, dict]:
+    complete = {
+        "status": "complete",
+        "completed_tasks": 492,
+        "expected_tasks": 492,
+        "total_tasks": 492,
+        "number_of_sessions": 9,
+        "number_of_variants": 2,
+        "number_of_seeds": 3,
+        "number_of_folds": 82,
+        "model_implementation_version": (
+            "fcnn_mean_std_temporal_statistics_v1.0.0"
+        ),
+    }
+    experiment = {
+        "output_version": "fcnn_mean_std_temporal_statistics_v1",
+        "task": "binary_presence",
+        "class_mapping": {"0": "no_stimulus", "1": "stimulus"},
+        "input_protocol": "clean4",
+        "raw_input_shape": [4, 128, 501],
+        "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+        "seeds": [0, 1, 2],
+        "variants": ["mean_only", "mean_std"],
+        "architectures": {
+            "mean_only": {
+                "method": "fcnn_bottleneck_temporal_statistics",
+                "variant": "mean_only",
+                "model_implementation_version": (
+                    "fcnn_mean_std_temporal_statistics_v1.0.0"
+                ),
+                "temporal_length": 4,
+                "temporal_reduction": "mean",
+                "trainable_parameters": 48011,
+            }
+        },
+        "training": {"max_epochs": 40},
+        "epoch_selection": "fixed 40 epochs; no validation or early stopping",
+        "cv": "exact formal clean4 cycle-grouped folds, max_folds=10",
+        "normalization": (
+            "pixel z-score fit on outer-training blocks and all four real frames only"
+        ),
+        "preprocessing": (
+            "clean4 -> per-frame arcsinh -> outer-train-fold all-frame "
+            "pixel z-score -> unchanged shared FCNN frame encoder -> "
+            "bottleneck temporal statistics"
+        ),
+        "test_used_for_normalization": False,
+        "test_used_for_feature_scaling": False,
+        "test_used_for_model_selection": False,
+        "test_used_for_early_stopping": False,
+    }
+    config = {
+        "model_implementation_version": (
+            "fcnn_mean_std_temporal_statistics_v1.0.0"
+        ),
+        "experiment_config": experiment,
+    }
+    return complete, config
+
+
+def test_meanpool_scientific_protocol_mismatch_stops() -> None:
+    runner = load_runner()
+    complete, config = valid_meanpool_protocol_payloads()
+    runner.validate_meanpool_protocol_payloads(complete, config)
+    config["experiment_config"]["input_protocol"] = "not_clean4"
+    with np.testing.assert_raises(AssertionError):
+        runner.validate_meanpool_protocol_payloads(complete, config)
+
+
+def test_direct_framework_import_is_in_source_provenance() -> None:
+    runner = load_runner()
+    relative = {
+        str(path.resolve().relative_to(PROJECT_DIR.resolve()))
+        for path in runner.source_paths(PROJECT_DIR)
+    }
+    assert "scripts/baselines/run_multiscale_temporal1d.py" in relative
+
+
 def test_formal_task_plan_is_246_and_exactly_maps_current_outer_plan() -> None:
     runner = load_runner()
     with tempfile.TemporaryDirectory() as temporary:
@@ -353,8 +514,16 @@ def test_run_complete_requires_full_246_of_246() -> None:
         "expected_test_block_predictions": 1368,
         "train_diagnostic_block_predictions": 11640,
         "expected_train_diagnostic_block_predictions": 11640,
-        "total_block_forwards": 13008,
-        "expected_total_block_forwards": 13008,
+        "canonical_block_forwards": 13008,
+        "expected_canonical_block_forwards": 13008,
+        "late_fusion_reconstructed_block_predictions": 1368,
+        "expected_late_fusion_reconstructed_block_predictions": 1368,
+        "late_fusion_verification_frame_forwards": 5472,
+        "expected_late_fusion_verification_frame_forwards": 5472,
+        "total_model_frame_forwards": 18480,
+        "expected_total_model_frame_forwards": 18480,
+        "late_fusion_reconstruction_status": "PASS",
+        "meanpool_sample_identity_status": "PASS",
         "training_performed": False,
         "device": "cpu",
     }
