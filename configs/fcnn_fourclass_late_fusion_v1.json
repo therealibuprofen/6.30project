@@ -1,0 +1,33 @@
+{
+  "experiment": "fcnn_fourclass_late_fusion_v1",
+  "task": "block_identity_4class",
+  "class_mapping": {
+    "0": "grating",
+    "1": "stop_after_grating",
+    "2": "dot",
+    "3": "static"
+  },
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "seeds": [0, 1, 2],
+  "clean4_frames_per_block": 4,
+  "chance_level": 0.25,
+  "outer_folds": 82,
+  "expected_tasks": 246,
+  "model": "MaxPool2d(2,2) -> Flatten(16000) -> Linear(16000,3) -> ReLU -> Linear(3,4)",
+  "fusion": "mean of four per-frame softmax vectors",
+  "normalization": "arcsinh then pixel z-score fit on outer-training frames only",
+  "optimizer": "AdamW",
+  "learning_rate": 0.001,
+  "weight_decay": 0.001,
+  "batch_size": 16,
+  "loss": "CrossEntropyLoss",
+  "epochs": 40,
+  "early_stopping": false,
+  "primary_metric": "concatenated block-level OOF balanced accuracy per session and seed",
+  "gate": {
+    "fourclass_9session_mean_ba_gte": 0.35,
+    "minimum_sessions": 6,
+    "session_ba_strictly_gt": 0.30,
+    "collapsed_binary_9session_mean_ba_gte": 0.55
+  }
+}
