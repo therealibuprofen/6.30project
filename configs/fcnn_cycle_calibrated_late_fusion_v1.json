@@ -1,0 +1,54 @@
+{
+  "output_version": "fcnn_cycle_calibrated_late_fusion_v1",
+  "task": "binary_presence",
+  "sessions": ["626", "628", "708", "709", "710", "807", "813", "817", "822"],
+  "seeds": [0, 1, 2],
+  "outer_tasks": 246,
+  "outer_folds": 82,
+  "historical_outer_checkpoint": {
+    "method": "fcnn_late_fusion",
+    "architecture": "MaxPool2d-Flatten-Linear(16000,3)-ReLU-Linear(3,2)",
+    "epoch": 40,
+    "parameters": 48011,
+    "retrain": false
+  },
+  "inner_cross_fit": {
+    "folds": 3,
+    "group": "cycle",
+    "scope": "outer-training cycles only",
+    "expected_trainings": 738
+  },
+  "inner_training": {
+    "epochs": 40,
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "weight_decay": 0.001,
+    "batch_size": 16,
+    "dropout_config": 0.25,
+    "dropout_used_by_fcnn": false,
+    "loss": "cross_entropy",
+    "normalization": "arcsinh_then_inner_train_pixel_zscore"
+  },
+  "calibration": {
+    "family": "one scalar temperature per outer session/fold/seed",
+    "parameterization": "T=exp(log_T)",
+    "objective": "inner-OOF frame NLL only",
+    "optimizer": "deterministic scipy L-BFGS-B",
+    "test_data_used": false
+  },
+  "fusion": {
+    "rule": "four-frame arithmetic probability mean",
+    "weights": [0.25, 0.25, 0.25, 0.25],
+    "confidence_weighting": false,
+    "timestamp_weighting": false,
+    "block_type_weighting": false
+  },
+  "strong_sessions": ["708", "709", "710"],
+  "weak_sessions": ["626", "628", "807", "813", "817", "822"],
+  "frozen_gate": {
+    "A_overall_ba_delta_min": 0.005,
+    "B_strong_ba_delta_min": -0.01,
+    "C_weak_ba_delta_min": 0.01,
+    "D_overall_ece_ratio_max": 0.8
+  }
+}
