@@ -26,6 +26,10 @@ The pre-registered gate is conjunction of four-class nine-session mean BA ≥0.3
 
 Every formal task saves an epoch-40 loadable checkpoint, exact identities and hashes, normalization arrays/config, training diagnostics, block predictions, and frame predictions. Resume skips only a task whose complete marker, hashes, checkpoint, metadata, output head, class mapping, fold membership, probability coverage, and fusion calculation all validate. `RUN_COMPLETE.json` is written only after all 246 tasks and all aggregate audits pass.
 
+Formal source provenance hashes the runner, its atomic I/O and fingerprint framework, the metric implementation, clean4 dataset helpers, normalization/training code, CV code, model definition, and experiment module. Git HEAD is recorded alongside the authoritative explicit SHA256 set without requiring a globally clean worktree. `RUN_COMPLETE.json` records SHA256 for every required aggregate artifact except itself, and `--stage status` reports `integrity-failed` if any recorded aggregate changes.
+
+The descriptive binary comparator is pinned to the provenance-validated `outputs/fcnn_canonical_single_frame_v1/session_summary.csv`. Its summary, `RUN_COMPLETE.json`, and `provenance_audit.json` hashes are recorded. Exactly nine unique formal sessions are required; this comparator remains excluded from training, model selection, and the feasibility gate.
+
 ## Commands
 
 Run a plan first:

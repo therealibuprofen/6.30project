@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -196,11 +197,11 @@ def _valid_task(tmp_path: Path):
     expected = {
         "session": "708", "seed": 0, "fold": 1, "train_cycles": "1", "test_cycles": "0",
         "dataset_fingerprint": "dataset", "split_fingerprint": "split", "task_fingerprint": "task", "run_fingerprint": "run",
-        "task_key": "708:0:1", "n_test_blocks": 4, "n_test_frames": 16,
+        "git_head": "a" * 40, "task_key": "708:0:1", "n_test_blocks": 4, "n_test_frames": 16,
     }
     path = tmp_path / "task"
     path.mkdir()
-    exact = {key: expected[key] for key in ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint")}
+    exact = {key: expected[key] for key in ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint", "git_head")}
     result_payload = {**exact, "task": TASK_NAME, "model_name": runner.MODEL_NAME, "model_version": runner.MODEL_VERSION, "class_mapping": CLASS_NAMES}
     runner.framework.atomic_json(path / "result.json", result_payload)
     normalization = {"phase": "outer_train_fold_only", "target_used_for_stats": False, "test_used_for_normalization_fit": False}
@@ -281,3 +282,46 @@ def test_24_binary_diagnostic_uses_probabilities_without_retraining() -> None:
     probabilities = np.eye(4)
     metrics = binary_metrics_from_fourclass(np.arange(4), probabilities)
     assert metrics == {"accuracy": 1.0, "balanced_accuracy": 1.0}
+
+
+def test_25_formal_source_provenance_includes_direct_runtime_dependencies() -> None:
+    runner = load_runner()
+    observed = {str(path.relative_to(PROJECT_ROOT)) for path in runner.formal_source_paths(PROJECT_ROOT)}
+    assert {
+        "scripts/baselines/run_multiscale_temporal1d.py",
+        "src/ultrasound_decoding/evaluate.py",
+        "src/ultrasound_decoding/multiframe/dataset.py",
+    }.issubset(observed)
+
+
+def test_26_aggregate_integrity_detects_post_completion_mutation(tmp_path: Path) -> None:
+    runner = load_runner()
+    for name in runner.REQUIRED_RUN_OUTPUTS:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original:{name}\n", encoding="utf-8")
+    completion = {"aggregate_artifact_sha256": runner.aggregate_artifact_sha256(tmp_path)}
+    assert runner.validate_aggregate_artifact_integrity(tmp_path, completion) == (True, "validated")
+    (tmp_path / "predictions.csv").write_text("tampered\n", encoding="utf-8")
+    valid, reason = runner.validate_aggregate_artifact_integrity(tmp_path, completion)
+    assert valid is False
+    assert "predictions.csv" in reason
+
+
+def test_27_malformed_canonical_binary_comparator_cannot_be_silent(tmp_path: Path) -> None:
+    runner = load_runner()
+    runner.framework.atomic_json(tmp_path / "RUN_COMPLETE.json", {"status": "complete", "number_of_sessions": 9})
+    runner.framework.atomic_json(tmp_path / "provenance_audit.json", {"status": "validated"})
+    pd.DataFrame({
+        "session": list(runner.EXPECTED_SESSIONS[:-1]),
+        "late_fusion_BA": np.full(8, 0.5),
+    }).to_csv(tmp_path / "session_summary.csv", index=False)
+    with pytest.raises(AssertionError, match="exactly 9 unique"):
+        runner.load_descriptive_binary_comparator(SimpleNamespace(project_root=PROJECT_ROOT), tmp_path)
+
+
+def test_28_git_head_is_exactly_recordable() -> None:
+    runner = load_runner()
+    head = runner.current_git_head(PROJECT_ROOT)
+    assert len(head) == 40
+    assert set(head).issubset(set("0123456789abcdef"))

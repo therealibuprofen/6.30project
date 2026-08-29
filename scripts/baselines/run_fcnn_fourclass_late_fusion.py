@@ -159,6 +159,26 @@ def read_declared_checksums(data_dir: Path) -> dict[str, str]:
     return entries
 
 
+def formal_source_paths(project_root: Path) -> list[Path]:
+    return [
+        project_root / "src/ultrasound_decoding/multiframe/fcnn_fourclass_late_fusion.py",
+        project_root / "src/ultrasound_decoding/multiframe/training.py",
+        project_root / "src/ultrasound_decoding/multiframe/dataset.py",
+        project_root / "src/ultrasound_decoding/deep.py",
+        project_root / "src/ultrasound_decoding/evaluate.py",
+        project_root / "src/ultrasound_decoding/cv.py",
+        project_root / "scripts/baselines/run_multiscale_temporal1d.py",
+        Path(__file__).resolve(),
+    ]
+
+
+def current_git_head(project_root: Path) -> str:
+    value = framework.git_text(project_root, "rev-parse", "HEAD")
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value.lower()):
+        raise AssertionError(f"unable to resolve exact Git HEAD: {value!r}")
+    return value
+
+
 def source_identities(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, str]]:
     declared = read_declared_checksums(args.data_dir)
     datasets: dict[str, Any] = {}
@@ -171,13 +191,7 @@ def source_identities(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
         if any(actual[name] != declared[name] for name in names):
             raise AssertionError(f"dataset checksum mismatch for session {session}")
         datasets[session] = {"declared_sha256": {name: declared[name] for name in names}, "actual_sha256": actual}
-    source_paths = [
-        args.project_root / "src/ultrasound_decoding/multiframe/fcnn_fourclass_late_fusion.py",
-        args.project_root / "src/ultrasound_decoding/multiframe/training.py",
-        args.project_root / "src/ultrasound_decoding/deep.py",
-        args.project_root / "src/ultrasound_decoding/cv.py",
-        Path(__file__).resolve(),
-    ]
+    source_paths = formal_source_paths(args.project_root)
     source_hashes = {str(path.relative_to(args.project_root)): framework.file_sha256(path) for path in source_paths}
     return datasets, source_hashes
 
@@ -273,6 +287,7 @@ def build_plan(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, di
         "protocol": protocol_config(),
         "dataset_identities": datasets,
         "source_hashes": source_hashes,
+        "git_head": current_git_head(args.project_root),
         "fold_reference": {
             "directory": str(args.fold_reference_dir),
             "task_plan_sha256": framework.file_sha256(args.fold_reference_dir / "task_plan.csv"),
@@ -286,6 +301,7 @@ def build_plan(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, di
     plan["run_fingerprint"] = run_fp
     plan["config_fingerprint"] = config_fp
     plan["runtime_fingerprint"] = runtime_fp
+    plan["git_head"] = identity["git_head"]
     plan["task_fingerprint"] = [framework.fingerprint({"run_fingerprint": run_fp, **row}) for row in task_rows]
     totals = {
         "sessions": len(EXPECTED_SESSIONS),
@@ -313,6 +329,7 @@ def write_plan(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, di
         "source_hashes": metadata["identity"]["source_hashes"],
         "dataset_identities": metadata["identity"]["dataset_identities"],
         "fold_reference": metadata["identity"]["fold_reference"],
+        "git_head": metadata["identity"]["git_head"],
         "run_fingerprint": plan.iloc[0]["run_fingerprint"],
     })
     framework.atomic_csv(args.output_dir / "task_plan.csv", plan)
@@ -339,7 +356,7 @@ def load_strict_plan(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFra
     expected_config = {**current_metadata["identity"]["protocol"], "run_fingerprint": expected_run_fp}
     if framework.fingerprint(config) != framework.fingerprint(expected_config):
         raise AssertionError("saved config.json differs from the frozen protocol")
-    if runtime.get("run_fingerprint") != expected_run_fp or runtime.get("source_hashes") != current_metadata["identity"]["source_hashes"] or runtime.get("dataset_identities") != current_metadata["identity"]["dataset_identities"]:
+    if runtime.get("run_fingerprint") != expected_run_fp or runtime.get("source_hashes") != current_metadata["identity"]["source_hashes"] or runtime.get("dataset_identities") != current_metadata["identity"]["dataset_identities"] or runtime.get("git_head") != current_metadata["identity"]["git_head"]:
         raise AssertionError("saved runtime/source/dataset fingerprints differ")
     return saved_plan, saved_splits, current_metadata
 
@@ -383,7 +400,7 @@ def validate_completed_task(path: Path, expected: dict[str, Any], *, raise_on_er
         return fail("completion identity mismatch")
     if complete.get("artifact_sha256") != task_artifact_hashes(path):
         return fail("artifact hashes mismatch")
-    exact_fields = ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint")
+    exact_fields = ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint", "git_head")
     for payload_name, payload in (("result", result), ("checkpoint", checkpoint)):
         for field in exact_fields:
             expected_value = int(expected[field]) if field in {"seed", "fold"} else str(expected[field])
@@ -520,7 +537,7 @@ def write_task(args: argparse.Namespace, row: dict[str, Any], *, epochs: int = F
     history.insert(0, "session", str(row["session"]))
     metrics = fixed_class_metrics(data.y[test_idx], result.predictions)
     result_payload = {
-        **{key: int(row[key]) if key in {"seed", "fold"} else str(row[key]) for key in ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint")},
+        **{key: int(row[key]) if key in {"seed", "fold"} else str(row[key]) for key in ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint", "git_head")},
         "task": TASK_NAME,
         "model_name": MODEL_NAME,
         "model_version": MODEL_VERSION,
@@ -539,7 +556,7 @@ def write_task(args: argparse.Namespace, row: dict[str, Any], *, epochs: int = F
         "device": result.device,
     }
     checkpoint = {
-        **{key: result_payload[key] for key in ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint")},
+        **{key: result_payload[key] for key in ("session", "seed", "fold", "train_cycles", "test_cycles", "dataset_fingerprint", "split_fingerprint", "task_fingerprint", "run_fingerprint", "git_head")},
         "task": TASK_NAME,
         "model_name": MODEL_NAME,
         "model_version": MODEL_VERSION,
@@ -620,13 +637,49 @@ def confusion_rows(predictions: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def historical_binary_comparison(args: argparse.Namespace) -> dict[str, float]:
-    path = args.project_root / "outputs/block_clean4_binary_all_models_9sessions_v1/aggregate/multiframe_all_models_seed_summary.csv"
-    if not path.is_file():
-        return {}
-    frame = pd.read_csv(path, dtype={"session": str})
-    frame = frame[frame["method"].astype(str) == "fcnn_late_fusion"]
-    return {str(row.session): float(row.balanced_accuracy_mean) for row in frame.itertuples()}
+def load_descriptive_binary_comparator(
+    args: argparse.Namespace,
+    source_dir: Path | None = None,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    directory = source_dir or args.project_root / "outputs/fcnn_canonical_single_frame_v1"
+    paths = {
+        "session_summary.csv": directory / "session_summary.csv",
+        "RUN_COMPLETE.json": directory / "RUN_COMPLETE.json",
+        "provenance_audit.json": directory / "provenance_audit.json",
+    }
+    missing = [name for name, path in paths.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"canonical descriptive binary comparator missing {missing}")
+    complete = json.loads(paths["RUN_COMPLETE.json"].read_text(encoding="utf-8"))
+    provenance = json.loads(paths["provenance_audit.json"].read_text(encoding="utf-8"))
+    if complete.get("status") != "complete" or int(complete.get("number_of_sessions", -1)) != len(EXPECTED_SESSIONS):
+        raise AssertionError("canonical binary comparator RUN_COMPLETE is invalid")
+    if provenance.get("status") != "validated":
+        raise AssertionError("canonical binary comparator provenance is not validated")
+    frame = pd.read_csv(paths["session_summary.csv"], dtype={"session": str})
+    required_columns = {"session", "late_fusion_BA"}
+    if not required_columns.issubset(frame.columns):
+        raise AssertionError("canonical binary comparator summary columns are incomplete")
+    sessions = frame["session"].astype(str)
+    if len(frame) != len(EXPECTED_SESSIONS) or sessions.duplicated().any() or set(sessions) != set(EXPECTED_SESSIONS):
+        raise AssertionError("canonical binary comparator must contain exactly 9 unique formal sessions")
+    values = pd.to_numeric(frame["late_fusion_BA"], errors="coerce").to_numpy(float)
+    if not np.isfinite(values).all():
+        raise AssertionError("canonical binary comparator contains non-finite BA")
+    comparison = dict(zip(sessions.tolist(), values.tolist()))
+    source_provenance = {
+        "source": "outputs/fcnn_canonical_single_frame_v1",
+        "source_directory": str(directory),
+        "source_artifact_sha256": {name: framework.file_sha256(path) for name, path in sorted(paths.items())},
+        "session_count": len(comparison),
+        "sessions": sorted(comparison),
+        "role": "descriptive_only",
+        "used_for_training": False,
+        "used_for_model_selection": False,
+        "used_for_feasibility_gate": False,
+        "canonical_provenance_status": "validated",
+    }
+    return comparison, source_provenance
 
 
 def aggregate_outputs(args: argparse.Namespace, plan: pd.DataFrame, metadata: dict[str, Any]) -> None:
@@ -689,7 +742,7 @@ def aggregate_outputs(args: argparse.Namespace, plan: pd.DataFrame, metadata: di
     session_summary = pd.DataFrame(session_rows)
 
     binary_seed = pd.DataFrame(binary_seed_rows)
-    historical = historical_binary_comparison(args)
+    historical, comparator_provenance = load_descriptive_binary_comparator(args)
     binary_rows = binary_seed_rows.copy()
     for session, group in binary_seed.groupby("session", sort=True):
         binary_rows.append({
@@ -723,6 +776,7 @@ def aggregate_outputs(args: argparse.Namespace, plan: pd.DataFrame, metadata: di
         "collapsed_binary_9session_mean_ba": collapsed_mean,
         "feasibility_gate": feasibility_gate(mean_ba, session_bas, collapsed_mean),
         "descriptive_binary_comparison_used_for_training_or_selection": False,
+        "descriptive_binary_comparator": comparator_provenance,
     }
     provenance = {
         "status": "PASS",
@@ -734,8 +788,10 @@ def aggregate_outputs(args: argparse.Namespace, plan: pd.DataFrame, metadata: di
         "no_duplicate_block_predictions_within_session_seed": True,
         "normalization_audit": "PASS",
         "class_mapping_exact": CLASS_NAMES,
+        "git_head": metadata["identity"]["git_head"],
         "source_hashes": metadata["identity"]["source_hashes"],
         "dataset_identities": metadata["identity"]["dataset_identities"],
+        "descriptive_binary_comparator": comparator_provenance,
     }
     framework.atomic_csv(args.output_dir / "checkpoint_manifest.csv", pd.DataFrame(checkpoint_rows))
     framework.atomic_csv(args.output_dir / "normalization_audit.csv", pd.DataFrame(normalization_rows))
@@ -749,6 +805,33 @@ def aggregate_outputs(args: argparse.Namespace, plan: pd.DataFrame, metadata: di
     framework.atomic_csv(args.output_dir / "binary_collapse_summary.csv", binary_summary)
     framework.atomic_json(args.output_dir / "statistical_audit.json", statistical)
     framework.atomic_json(args.output_dir / "provenance_audit.json", provenance)
+
+
+def aggregate_artifact_sha256(output_dir: Path) -> dict[str, str]:
+    missing = [name for name in REQUIRED_RUN_OUTPUTS if not (output_dir / name).is_file()]
+    if missing:
+        raise AssertionError(f"required aggregate artifacts missing: {missing}")
+    return {name: framework.file_sha256(output_dir / name) for name in sorted(REQUIRED_RUN_OUTPUTS)}
+
+
+def validate_aggregate_artifact_integrity(
+    output_dir: Path,
+    completion: dict[str, Any],
+) -> tuple[bool, str]:
+    expected = completion.get("aggregate_artifact_sha256")
+    if not isinstance(expected, dict):
+        return False, "RUN_COMPLETE lacks aggregate_artifact_sha256"
+    if "RUN_COMPLETE.json" in expected:
+        return False, "RUN_COMPLETE must not hash itself"
+    if set(expected) != set(REQUIRED_RUN_OUTPUTS):
+        return False, "aggregate hash manifest coverage mismatch"
+    missing = [name for name in sorted(expected) if not (output_dir / name).is_file()]
+    if missing:
+        return False, f"aggregate artifacts missing: {missing}"
+    changed = [name for name in sorted(expected) if framework.file_sha256(output_dir / name) != str(expected[name])]
+    if changed:
+        return False, f"aggregate artifact SHA256 mismatch: {changed}"
+    return True, "validated"
 
 
 def run_full(args: argparse.Namespace) -> None:
@@ -778,12 +861,16 @@ def run_full(args: argparse.Namespace) -> None:
     provenance = json.loads((args.output_dir / "provenance_audit.json").read_text(encoding="utf-8"))
     predictions = pd.read_csv(args.output_dir / "predictions.csv", dtype={"session": str})
     assert_run_completion_ready(completed, checkpoint_manifest, predictions, provenance)
+    aggregate_hashes = aggregate_artifact_sha256(args.output_dir)
     framework.atomic_json(args.output_dir / "RUN_COMPLETE.json", {
         "status": "complete", "completed_utc": utc_now(), "completed_tasks": EXPECTED_TASKS, "expected_tasks": EXPECTED_TASKS,
         "number_of_sessions": len(EXPECTED_SESSIONS), "number_of_folds": EXPECTED_FOLDS, "number_of_seeds": len(SEEDS),
         "checkpoint_coverage": "246/246", "prediction_coverage_complete": True, "no_duplicate_block_predictions": True,
         "normalization_audit": "PASS", "provenance_audit": "PASS", "fourclass_labels_exact": True,
         "probability_audit": "PASS", "collapsed_binary_audit": "complete", "run_fingerprint": str(plan.iloc[0]["run_fingerprint"]),
+        "git_head": str(plan.iloc[0]["git_head"]),
+        "source_hashes_authoritative": True,
+        "aggregate_artifact_sha256": aggregate_hashes,
         "required_outputs": list(REQUIRED_RUN_OUTPUTS),
     })
     print("RUN_COMPLETE written: strict 246/246", flush=True)
@@ -813,7 +900,38 @@ def run_status(args: argparse.Namespace) -> None:
         counts[key] += 1
         if not valid:
             reasons[reason] = reasons.get(reason, 0) + 1
-    print(json.dumps({"expected": EXPECTED_TASKS, **counts, "reasons": reasons, "run_complete": (args.output_dir / "RUN_COMPLETE.json").is_file()}, indent=2), flush=True)
+    complete_path = args.output_dir / "RUN_COMPLETE.json"
+    integrity_status, integrity_reason = "not-applicable", "RUN_COMPLETE absent"
+    formal_run_status = "incomplete"
+    if complete_path.is_file():
+        try:
+            complete = json.loads(complete_path.read_text(encoding="utf-8"))
+            integrity_valid, integrity_reason = validate_aggregate_artifact_integrity(args.output_dir, complete)
+            integrity_status = "PASS" if integrity_valid else "FAIL"
+            metadata_valid = (
+                complete.get("status") == "complete"
+                and complete.get("git_head") == str(plan.iloc[0]["git_head"])
+                and complete.get("run_fingerprint") == str(plan.iloc[0]["run_fingerprint"])
+            )
+            if not integrity_valid:
+                formal_run_status = "integrity-failed"
+            elif counts["valid"] == EXPECTED_TASKS and metadata_valid:
+                formal_run_status = "valid"
+            else:
+                formal_run_status = "invalid"
+        except Exception as exc:
+            integrity_status = "FAIL"
+            integrity_reason = f"unreadable RUN_COMPLETE: {exc}"
+            formal_run_status = "integrity-failed"
+    print(json.dumps({
+        "expected": EXPECTED_TASKS,
+        **counts,
+        "reasons": reasons,
+        "run_complete": complete_path.is_file(),
+        "formal_run_status": formal_run_status,
+        "aggregate_integrity": integrity_status,
+        "aggregate_integrity_reason": integrity_reason,
+    }, indent=2), flush=True)
 
 
 def main() -> None:
