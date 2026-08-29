@@ -213,6 +213,106 @@ def test_oof_ba_is_computed_after_concatenation_not_mean_fold_ba() -> None:
     assert seed_summary.iloc[0]["baseline_ba"] != (1.0 + 0.5) / 2.0
 
 
+def unequal_session_predictions() -> pd.DataFrame:
+    rows = []
+
+    def add(session: str, n_per_class: int, baseline_mode: str) -> None:
+        for truth in (0, 1):
+            for item in range(n_per_class):
+                if baseline_mode == "perfect":
+                    baseline = truth
+                elif baseline_mode == "all_zero":
+                    baseline = 0
+                else:
+                    raise ValueError(baseline_mode)
+                rows.append(
+                    {
+                        "session": session,
+                        "seed": 0,
+                        "fold": 1 if item == 0 else 2,
+                        "truth": truth,
+                        "baseline_pred": baseline,
+                        "cclf_pred": truth,
+                    }
+                )
+
+    add("708", 1, "perfect")
+    add("709", 4, "all_zero")
+    add("626", 1, "all_zero")
+    add("628", 4, "all_zero")
+    return pd.DataFrame(rows)
+
+
+def test_cross_session_ba_is_equal_session_mean_not_pooled_blocks() -> None:
+    runner = load_runner()
+    predictions = unequal_session_predictions()
+    _seed_summary, summary = runner.summarize_ba(predictions)
+    sessions = summary[summary["scope"].eq("session")].set_index("scope_id")
+    assert sessions.loc["708", "baseline_ba"] == 1.0
+    assert sessions.loc["709", "baseline_ba"] == 0.5
+    assert sessions.loc["626", "baseline_ba"] == 0.5
+    assert sessions.loc["628", "baseline_ba"] == 0.5
+
+    overall = summary[summary["scope"].eq("overall")].iloc[0]
+    strong = summary[summary["scope"].eq("strong")].iloc[0]
+    weak = summary[summary["scope"].eq("weak")].iloc[0]
+    assert overall["baseline_ba"] == 0.625
+    assert strong["baseline_ba"] == 0.75
+    assert weak["baseline_ba"] == 0.5
+    assert overall["baseline_ba"] != overall["baseline_pooled_block_ba"]
+    assert strong["baseline_ba"] != strong["baseline_pooled_block_ba"]
+    assert overall["aggregation"] == "arithmetic_mean_of_session_ba"
+    aggregate_source = inspect.getsource(runner.aggregate_outputs)
+    assert "baseline_overall_ba=overall.baseline_ba" in aggregate_source
+    assert "baseline_strong_ba=strong.baseline_ba" in aggregate_source
+    assert "baseline_weak_ba=weak.baseline_ba" in aggregate_source
+
+
+def test_loso_is_mean_of_remaining_session_deltas_not_pooled_predictions() -> None:
+    runner = load_runner()
+    _seed_summary, summary = runner.summarize_ba(unequal_session_predictions())
+    session_rows = summary[summary["scope"].eq("session")]
+    loso = pd.DataFrame(runner.leave_one_session_out_mean_delta(summary)).set_index(
+        "heldout_session"
+    )
+    for heldout in session_rows["scope_id"]:
+        expected = float(
+            session_rows[~session_rows["scope_id"].eq(heldout)]["delta"].mean()
+        )
+        assert loso.loc[heldout, "mean_session_delta"] == expected
+        assert loso.loc[heldout, "delta"] == expected
+        assert loso.loc[heldout, "aggregation"] == (
+            "arithmetic_mean_of_remaining_session_deltas"
+        )
+
+
+def test_real_historical_reference_has_frozen_equal_session_baselines() -> None:
+    runner = load_runner()
+    reference = pd.read_csv(
+        PROJECT_DIR
+        / "outputs/fcnn_canonical_single_frame_v1/late_fusion_reconstructed_predictions.csv",
+        dtype={"session": str},
+    )
+    reference["baseline_pred"] = reference["pred"].astype(int)
+    reference["cclf_pred"] = reference["pred"].astype(int)
+    _seed_summary, summary = runner.summarize_ba(reference)
+    by_scope = summary.set_index("scope")
+    assert np.isclose(
+        by_scope.loc["overall", "baseline_ba"], 0.6141905162738496, atol=1e-15
+    )
+    assert np.isclose(
+        by_scope.loc["strong", "baseline_ba"], 0.9006734006734006, atol=1e-15
+    )
+    assert np.isclose(
+        by_scope.loc["weak", "baseline_ba"], 0.4709490740740741, atol=1e-15
+    )
+    assert np.isclose(
+        by_scope.loc["overall", "baseline_pooled_block_ba"],
+        0.6432748538011696,
+        atol=1e-15,
+    )
+
+
 def test_frozen_gate_requires_all_four_conditions() -> None:
     passed = evaluate_frozen_gate(
         baseline_overall_ba=0.60, cclf_overall_ba=0.605,

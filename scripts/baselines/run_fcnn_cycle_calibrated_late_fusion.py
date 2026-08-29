@@ -850,15 +850,75 @@ def summarize_ba(predictions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     for session, group in predictions.groupby("session", sort=True):
         baseline = block_balanced_accuracy(group["truth"], group["baseline_pred"])
         cclf = block_balanced_accuracy(group["truth"], group["cclf_pred"])
-        session_rows.append({"scope": "session", "scope_id": str(session), "n_blocks": len(group), "baseline_ba": baseline, "cclf_ba": cclf, "delta": cclf - baseline})
+        session_rows.append(
+            {
+                "scope": "session",
+                "scope_id": str(session),
+                "aggregation": "concatenate_oof_within_session",
+                "n_sessions": 1,
+                "n_blocks": len(group),
+                "baseline_ba": baseline,
+                "cclf_ba": cclf,
+                "delta": cclf - baseline,
+                "baseline_pooled_block_ba": baseline,
+                "cclf_pooled_block_ba": cclf,
+                "pooled_block_delta": cclf - baseline,
+            }
+        )
+    session_frame = pd.DataFrame(session_rows)
     for scope_id, sessions in (("strong", STRONG_SESSIONS), ("weak", WEAK_SESSIONS), ("overall", tuple(EXPECTED_SESSIONS))):
         group = predictions[predictions["session"].isin(sessions)]
-        if group.empty:
+        selected_sessions = session_frame[session_frame["scope_id"].isin(sessions)]
+        if group.empty or selected_sessions.empty:
             continue
-        baseline = block_balanced_accuracy(group["truth"], group["baseline_pred"])
-        cclf = block_balanced_accuracy(group["truth"], group["cclf_pred"])
-        session_rows.append({"scope": scope_id, "scope_id": ",".join(sessions), "n_blocks": len(group), "baseline_ba": baseline, "cclf_ba": cclf, "delta": cclf - baseline})
+        baseline = float(selected_sessions["baseline_ba"].mean())
+        cclf = float(selected_sessions["cclf_ba"].mean())
+        pooled_baseline = block_balanced_accuracy(
+            group["truth"], group["baseline_pred"]
+        )
+        pooled_cclf = block_balanced_accuracy(group["truth"], group["cclf_pred"])
+        session_rows.append(
+            {
+                "scope": scope_id,
+                "scope_id": ",".join(sessions),
+                "aggregation": "arithmetic_mean_of_session_ba",
+                "n_sessions": len(selected_sessions),
+                "n_blocks": len(group),
+                "baseline_ba": baseline,
+                "cclf_ba": cclf,
+                "delta": cclf - baseline,
+                "baseline_pooled_block_ba": pooled_baseline,
+                "cclf_pooled_block_ba": pooled_cclf,
+                "pooled_block_delta": pooled_cclf - pooled_baseline,
+            }
+        )
     return session_seed, pd.DataFrame(session_rows)
+
+
+def leave_one_session_out_mean_delta(session_summary: pd.DataFrame) -> list[dict[str, Any]]:
+    sessions = session_summary[session_summary["scope"].eq("session")].copy()
+    if sessions.empty or sessions["scope_id"].duplicated().any():
+        raise ValueError("LOSO requires unique session-level BA rows")
+    rows: list[dict[str, Any]] = []
+    for heldout in sessions["scope_id"].astype(str).sort_values():
+        remaining = sessions[~sessions["scope_id"].astype(str).eq(heldout)]
+        if remaining.empty:
+            raise ValueError("LOSO requires at least two sessions")
+        baseline = float(remaining["baseline_ba"].mean())
+        cclf = float(remaining["cclf_ba"].mean())
+        mean_delta = float(remaining["delta"].mean())
+        rows.append(
+            {
+                "heldout_session": heldout,
+                "remaining_sessions": int(len(remaining)),
+                "aggregation": "arithmetic_mean_of_remaining_session_deltas",
+                "baseline_mean_session_ba": baseline,
+                "cclf_mean_session_ba": cclf,
+                "mean_session_delta": mean_delta,
+                "delta": mean_delta,
+            }
+        )
+    return rows
 
 
 def summarize_calibration(frames: pd.DataFrame) -> pd.DataFrame:
@@ -924,11 +984,10 @@ def aggregate_outputs(args: argparse.Namespace, plan: pd.DataFrame, metadata: di
         cclf_overall_ece=calibration_lookup[("overall", "post")].ece,
     )
     session_deltas = session_summary[session_summary["scope"].eq("session")]["delta"].to_numpy(float)
-    loso = []
-    for heldout in EXPECTED_SESSIONS:
-        group = predictions[~predictions["session"].eq(heldout)]
-        loso.append({"heldout_session": heldout, "baseline_ba": block_balanced_accuracy(group["truth"], group["baseline_pred"]), "cclf_ba": block_balanced_accuracy(group["truth"], group["cclf_pred"])})
-        loso[-1]["delta"] = loso[-1]["cclf_ba"] - loso[-1]["baseline_ba"]
+    formal_session_rows = session_summary[session_summary["scope"].eq("session")]
+    if set(formal_session_rows["scope_id"].astype(str)) != set(EXPECTED_SESSIONS):
+        raise AssertionError("formal session BA summary does not cover exact 9 sessions")
+    loso = leave_one_session_out_mean_delta(session_summary)
     statistical = {
         "per_session_delta": dict(zip(session_summary[session_summary["scope"].eq("session")]["scope_id"], session_deltas.tolist())),
         "improved_sessions": int(np.sum(session_deltas > 1e-15)),
