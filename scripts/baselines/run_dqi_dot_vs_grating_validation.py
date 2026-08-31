@@ -47,6 +47,7 @@ from ultrasound_decoding.multiframe.dqi_dot_vs_grating import (
 )
 
 BASELINE_ATOL = 2e-6
+HISTORICAL_OUTER_INFERENCE_DEVICE = "cpu"
 REQUIRED_TASK_FILES = ("result.json", "inner_split_manifest.csv", "inner_training_summary.csv", "inner_oof_logits.csv", "inner_oof_predictions.csv", "leakage_audit.json")
 REQUIRED_RUN_OUTPUTS = ("DQI_DOT_VS_GRATING_VALIDATION.md", "config.json", "runtime_fingerprint.json", "task_plan.csv", "inner_split_manifest.csv", "historical_fcnn_checkpoint_manifest.csv", "inner_oof_manifest.csv", "outer_task_quality.csv", "inner_oof_predictions.csv", "outer_fold_seed_averaged.csv", "within_session_fold_relationship.csv", "session_quality_summary.csv", "QUALITY_FROZEN.json", "outer_target_predictions.csv", "outer_target_reconstruction_audit.json", "loo_robustness.csv", "cross_task_relationship_matrix.csv", "statistical_audit.json", "provenance_audit.json")
 
@@ -103,7 +104,9 @@ def _csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, dtype={"session": str})
 
 
-def historical_assets(a: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
+def historical_checkpoint_manifest(a: argparse.Namespace) -> pd.DataFrame:
+    """Read checkpoint metadata only; this is legal before Q is frozen."""
+
     manifest = _csv(a.historical_aggregate_dir / "checkpoint_manifest.csv")
     required = {"session", "seed", "fold", "method", "status", "checkpoint_path", "checkpoint_sha256", "train_cycles", "test_cycles"}
     if not required.issubset(manifest): raise AssertionError("historical checkpoint manifest schema changed")
@@ -111,12 +114,31 @@ def historical_assets(a: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
     fcnn[["session", "seed", "fold"]] = fcnn[["session", "seed", "fold"]].astype({"session": str, "seed": int, "fold": int})
     fcnn = fcnn.sort_values(["session", "seed", "fold"]).reset_index(drop=True)
     if len(fcnn) != EXPECTED_OUTER_TASKS or fcnn[["session", "seed", "fold"]].duplicated().any(): raise AssertionError("must have exactly 246 available unique DG FCNN checkpoints")
+    return fcnn
+
+
+def load_historical_prediction_reference(
+    a: argparse.Namespace, *, require_quality_frozen: bool
+) -> pd.DataFrame:
+    """First semantic target-table read, guarded by frozen-Q metadata in formal full."""
+
+    if require_quality_frozen:
+        frozen_path = a.output_dir / "QUALITY_FROZEN.json"
+        quality_path = a.output_dir / "session_training_only_quality.csv"
+        if not frozen_path.is_file() or not quality_path.is_file():
+            raise RuntimeError("historical target reference is locked until Q_DG is frozen")
+        frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+        if (
+            frozen.get("status") != "frozen_before_target_reference_load"
+            or frozen.get("session_quality_sha256") != framework.file_sha256(quality_path)
+        ):
+            raise AssertionError("QUALITY_FROZEN guard or session-Q SHA256 is invalid")
     predictions = _csv(a.historical_aggregate_dir / "multiframe_all_models_predictions.csv")
     predictions = predictions[predictions.method.eq("fcnn_late_fusion")].copy()
     predictions["session"] = predictions.session.astype(str)
     if len(predictions) != 684 or predictions[["session", "seed", "block_id"]].duplicated().any(): raise AssertionError("historical DG FCNN predictions must be 684 unique session/seed/block rows")
     if set(predictions.task.astype(str)) != {HISTORICAL_TASK_NAME} or not {"truth", "pred", "prob_dot", "prob_grating"}.issubset(predictions): raise AssertionError("historical DG FCNN predictions lack required task/probability fields")
-    return fcnn, predictions
+    return predictions
 
 
 def dataset_identity(a: argparse.Namespace) -> dict[str, Any]:
@@ -130,7 +152,7 @@ def dataset_identity(a: argparse.Namespace) -> dict[str, Any]:
 
 def build_plan(a: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     validate_authoritative_mapping()
-    fcnn, _ = historical_assets(a)
+    fcnn = historical_checkpoint_manifest(a)
     binary = _csv(a.binary_plan_dir / "task_plan.csv")
     binary[["session", "seed", "fold"]] = binary[["session", "seed", "fold"]].astype({"session": str, "seed": int, "fold": int})
     left = fcnn.sort_values(["session", "seed", "fold"]); right = binary.sort_values(["session", "seed", "fold"])
@@ -154,7 +176,7 @@ def build_plan(a: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, dict[
 
 def write_plan(a: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     plan, inner, meta = build_plan(a); a.output_dir.mkdir(parents=True, exist_ok=True)
-    fcnn, _ = historical_assets(a)
+    fcnn = historical_checkpoint_manifest(a)
     framework.atomic_json(a.output_dir / "config.json", {**formal_protocol(), "run_fingerprint": meta["run_fingerprint"]})
     framework.atomic_text(a.output_dir / "DQI_DOT_VS_GRATING_VALIDATION.md", (a.project_root / "docs/dqi_dot_vs_grating_validation_v1.md").read_text(encoding="utf-8"))
     framework.atomic_json(a.output_dir / "runtime_fingerprint.json", {**meta["identity"], "run_fingerprint": meta["run_fingerprint"], "source_hashes_authoritative": True})
@@ -190,6 +212,38 @@ def _task_hashes(path: Path) -> dict[str, str]:
     return {n: framework.file_sha256(path / n) for n in REQUIRED_TASK_FILES}
 
 
+def validation_mutation_normalization_audit(
+    blocks: np.ndarray,
+    train_indices: np.ndarray,
+    validation_indices: np.ndarray,
+) -> dict[str, Any]:
+    """Actually mutate validation pixels in a full copy, then refit from train indices."""
+
+    values = np.asarray(blocks, dtype=np.float32)
+    train = np.asarray(train_indices, dtype=np.int64)
+    validation = np.asarray(validation_indices, dtype=np.int64)
+    if not len(train) or not len(validation) or set(train) & set(validation):
+        raise ValueError("mutation audit requires disjoint nonempty train/validation indices")
+    mean, std, before = fit_inner_train_normalization(values[train])
+    mutated = values.copy()
+    mutated[validation] = mutated[validation] + np.float32(1000.0)
+    if np.array_equal(mutated[validation], values[validation]):
+        raise AssertionError("validation mutation was not applied")
+    after_mean, after_std, after = fit_inner_train_normalization(mutated[train])
+    unchanged = bool(
+        before == after
+        and np.array_equal(mean, after_mean)
+        and np.array_equal(std, after_std)
+    )
+    return {
+        "validation_pixels_actually_changed": True,
+        "train_pixels_unchanged": bool(np.array_equal(mutated[train], values[train])),
+        "normalization_arrays_unchanged": unchanged,
+        "normalization_fingerprint_before": before,
+        "normalization_fingerprint_after": after,
+    }
+
+
 def write_q_task(a: argparse.Namespace, row: dict[str, Any], inner: pd.DataFrame, *, training_config: Any = FORMAL_TRAINING_CONFIG, destination_base: Path | None = None) -> Path:
     root = destination_base or a.output_dir; dst = _task_dir(root, row); dst.mkdir(parents=True, exist_ok=True)
     data = load_block_sequence_session(a.project_root, str(row["session"]), HISTORICAL_TASK_NAME, data_dir=a.data_dir); validate_dot_vs_grating_data(data)
@@ -202,10 +256,9 @@ def write_q_task(a: argparse.Namespace, row: dict[str, Any], inner: pd.DataFrame
         tr = outer_train[np.isin(data.groups[outer_train], tr_cycles)]; va = outer_train[np.isin(data.groups[outer_train], va_cycles)]
         if set(data.groups[tr]) & set(data.groups[va]) or set(data.groups[va]) & set(data.groups[np.setdiff1d(np.arange(len(data.y)), outer_train)]): raise AssertionError("inner cycle isolation/outer-test exclusion failed")
         mean, std, norm_fp = fit_inner_train_normalization(data.X[tr])
-        # Mutation proof: validation must not affect train-only statistics.
-        mutated = data.X[va].copy(); mutated.reshape(-1)[0] += 1000.0
-        m2, s2, fp2 = fit_inner_train_normalization(data.X[tr])
-        if fp2 != norm_fp or not np.array_equal(m2, mean) or not np.array_equal(s2, std): raise AssertionError("validation mutation changed normalization")
+        mutation = validation_mutation_normalization_audit(data.X, tr, va)
+        if not mutation["train_pixels_unchanged"] or not mutation["normalization_arrays_unchanged"] or mutation["normalization_fingerprint_before"] != norm_fp:
+            raise AssertionError("validation mutation changed train-only normalization")
         key = build_task_inner_cache_key(task=TASK_NAME, session=str(row["session"]), outer_fold=int(row["fold"]), outer_seed=int(row["seed"]), outer_train_cycles=[int(x) for x in str(row["outer_train_cycles"]).split(",")], inner_fold=int(split["inner_fold"]), inner_train_cycles=tr_cycles, inner_validation_cycles=va_cycles, source_hash=source_hash, protocol_hash=protocol_hash, normalization_fingerprint=norm_fp, training_config=asdict(training_config))
         logits, history, seen_fp = train_inner_fcnn(data.X[tr], data.y[tr], data.X[va], seed=int(row["seed"]), device=str(a.device), training_config=training_config)
         if seen_fp != norm_fp: raise AssertionError("training normalization fingerprint differs")
@@ -214,12 +267,12 @@ def write_q_task(a: argparse.Namespace, row: dict[str, Any], inner: pd.DataFrame
             md = data.metadata.iloc[int(idx)]
             for position in range(FRAMES_PER_BLOCK): frames.append({"session": str(row["session"]), "outer_seed": int(row["seed"]), "outer_fold": int(row["fold"]), "inner_fold": int(split["inner_fold"]), "source_index": int(idx), "block_id": str(md.block_id), "cycle": int(data.groups[idx]), "frame_position": position, "truth": int(data.y[idx]), "logit_dot": float(logits[i, position, 0]), "logit_grating": float(logits[i, position, 1]), "heldout_cycle": int(data.groups[idx]), "cache_key": key})
         sums.append({"task_key": row["task_key"], "inner_fold": int(split["inner_fold"]), "n_train_blocks": len(tr), "n_validation_blocks": len(va), "trained_epochs": len(history), "final_train_loss": float(history[-1]["train_loss"]), "normalization_fingerprint": norm_fp, "cache_key": key, "outer_test_used": False})
-        split_rows.append({**split, "normalization_fingerprint": norm_fp, "cache_key": key, "validation_mutation_normalization_unchanged": True})
+        split_rows.append({**split, "normalization_fingerprint": norm_fp, "cache_key": key, **mutation})
     oof = pd.DataFrame(frames).sort_values(["source_index", "frame_position"]).reset_index(drop=True)
     assert_complete_inner_oof(oof.source_index.to_numpy(int), outer_train, oof.cycle.to_numpy(int), oof.heldout_cycle.to_numpy(int))
     block = block_predictions_from_frame_logits(oof); q = concatenated_oof_balanced_accuracy(block)
     result = {"task_key": row["task_key"], "task_fingerprint": row["task_fingerprint"], "run_fingerprint": row["run_fingerprint"], "Q_DG_concatenated_inner_oof_block_BA": q, "mean_inner_fold_ba_diagnostic": mean_inner_fold_ba_diagnostic(block), "metric_definition": "concatenate all inner-OOF block predictions then balanced accuracy", "outer_test_read": False, "trained_epochs": int(training_config.max_epochs)}
-    framework.atomic_json(dst / "result.json", result); framework.atomic_csv(dst / "inner_split_manifest.csv", pd.DataFrame(split_rows)); framework.atomic_csv(dst / "inner_training_summary.csv", pd.DataFrame(sums)); framework.atomic_csv(dst / "inner_oof_logits.csv", oof); framework.atomic_csv(dst / "inner_oof_predictions.csv", block); framework.atomic_json(dst / "leakage_audit.json", {"outer_test_used": False, "inner_cycle_grouped": True, "validation_mutation_normalization_unchanged": True})
+    framework.atomic_json(dst / "result.json", result); framework.atomic_csv(dst / "inner_split_manifest.csv", pd.DataFrame(split_rows)); framework.atomic_csv(dst / "inner_training_summary.csv", pd.DataFrame(sums)); framework.atomic_csv(dst / "inner_oof_logits.csv", oof); framework.atomic_csv(dst / "inner_oof_predictions.csv", block); framework.atomic_json(dst / "leakage_audit.json", {"outer_test_used": False, "inner_cycle_grouped": True, "validation_pixels_actually_changed": True, "train_pixels_unchanged": True, "validation_mutation_normalization_unchanged": True})
     framework.atomic_json(dst / "COMPLETE.json", {"status": "complete", "task_fingerprint": row["task_fingerprint"], "artifact_sha256": _task_hashes(dst)})
     return dst
 
@@ -227,9 +280,59 @@ def write_q_task(a: argparse.Namespace, row: dict[str, Any], inner: pd.DataFrame
 def _historical_outer(a: argparse.Namespace, row: dict[str, Any], data: Any) -> pd.DataFrame:
     _, test = _indices(data, row)
     model, payload, _ = load_validated_checkpoint(Path(row["historical_checkpoint_path"]), expected_sha256=str(row["historical_checkpoint_sha256"]), expected_session=str(row["session"]), expected_seed=int(row["seed"]), expected_fold=int(row["fold"]), expected_train_cycles=str(row["outer_train_cycles"]), expected_test_cycles=str(row["outer_test_cycles"]), expected_task=HISTORICAL_TASK_NAME)
+    model_devices = {parameter.device.type for parameter in model.parameters()}
+    if model_devices != {HISTORICAL_OUTER_INFERENCE_DEVICE}:
+        raise RuntimeError(f"historical checkpoint model must remain CPU-only, got {model_devices}")
     normalized = apply_saved_normalization(data.X[test].reshape(-1, 128, 501), payload["normalization_mean"], payload["normalization_std"], transform=NORMALIZATION_TRANSFORM).reshape(len(test), 4, 128, 501)
-    probs = softmax_probabilities(predict_raw_logits(model, normalized, device=a.device, batch_size=a.inference_batch_size)).reshape(len(test), 4, 2).mean(1)
+    probs = softmax_probabilities(predict_raw_logits(model, normalized, device=HISTORICAL_OUTER_INFERENCE_DEVICE, batch_size=a.inference_batch_size)).reshape(len(test), 4, 2).mean(1)
     return pd.DataFrame({"session": str(row["session"]), "seed": int(row["seed"]), "fold": int(row["fold"]), "block_id": data.metadata.iloc[test].block_id.astype(str).to_numpy(), "truth": data.y[test].astype(int), "prob_dot": probs[:,0], "prob_grating": probs[:,1], "prediction": probs.argmax(1)})
+
+
+def historical_reconstruction_audit(
+    reconstructed: pd.DataFrame,
+    reference: pd.DataFrame,
+    *,
+    expected_rows: int,
+    tolerance: float = BASELINE_ATOL,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Align exact sample identities and audit truth, predictions, and probabilities."""
+
+    keys = ["session", "seed", "block_id"]
+    if "fold" in reconstructed.columns and "fold" in reference.columns:
+        keys.insert(2, "fold")
+    for frame in (reconstructed, reference):
+        missing = set(keys) - set(frame.columns)
+        if missing:
+            raise ValueError(f"reconstruction input lacks identity columns {sorted(missing)}")
+    duplicate_identity_count = int(reconstructed.duplicated(keys).sum() + reference.duplicated(keys).sum())
+    identity = reconstructed[keys].merge(reference[keys], on=keys, how="outer", indicator=True)
+    identity_mismatch_count = int(identity["_merge"].ne("both").sum() + duplicate_identity_count)
+    merged = reconstructed.merge(reference, on=keys, how="inner", suffixes=("_reconstructed", "_historical"), validate="one_to_one" if duplicate_identity_count == 0 else "many_to_many")
+    truth_mismatch_count = int((merged["truth_reconstructed"].astype(int) != merged["truth_historical"].astype(int)).sum()) if len(merged) else int(expected_rows)
+    prediction_mismatch_count = int((merged["prediction"].astype(int) != merged["pred"].astype(int)).sum()) if len(merged) else int(expected_rows)
+    probability_columns = ["prob_dot", "prob_grating"]
+    differences = [np.abs(merged[f"{name}_reconstructed"].to_numpy(float) - merged[f"{name}_historical"].to_numpy(float)) for name in probability_columns]
+    max_probability_abs_diff = float(np.max(np.concatenate(differences))) if len(merged) else None
+    row_count_valid = len(reconstructed) == len(reference) == len(merged) == int(expected_rows)
+    probability_valid = max_probability_abs_diff is not None and max_probability_abs_diff <= float(tolerance)
+    status = "PASS" if row_count_valid and identity_mismatch_count == 0 and truth_mismatch_count == 0 and prediction_mismatch_count == 0 and probability_valid else "FAIL"
+    return ({"n_rows": int(len(merged)), "identity_keys": keys, "identity_mismatch_count": identity_mismatch_count, "truth_mismatch_count": truth_mismatch_count, "prediction_mismatch_count": prediction_mismatch_count, "max_probability_abs_diff": max_probability_abs_diff, "tolerance": float(tolerance), "status": status}, merged)
+
+
+def require_reconstruction_pass(audit: dict[str, Any]) -> None:
+    if audit.get("status") != "PASS":
+        raise AssertionError(f"historical DG reconstruction audit failed: {audit}")
+
+
+def session_target_from_oof(targets: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute one OOF BA per session/seed, then arithmetic mean the three seeds."""
+
+    rows = [{"session": str(session), "seed": int(seed), "BA_DG_seed_OOF": float(balanced_accuracy_score(group.truth, group.prediction))} for (session, seed), group in targets.groupby(["session", "seed"], sort=True)]
+    seed_ba = pd.DataFrame(rows)
+    if seed_ba[["session", "seed"]].duplicated().any() or not seed_ba.groupby("session").seed.nunique().eq(len(SEEDS)).all():
+        raise AssertionError("formal target requires exactly three seed-level OOF BAs per session")
+    session = seed_ba.groupby("session", as_index=False).BA_DG_seed_OOF.mean().rename(columns={"BA_DG_seed_OOF": "BA_DG_session"})
+    return seed_ba, session
 
 
 def run_sanity(a: argparse.Namespace) -> None:
@@ -238,12 +341,12 @@ def run_sanity(a: argparse.Namespace) -> None:
     plan, inner, _ = load_strict_plan(a); row = plan.iloc[0].to_dict(); cfg = replace(FORMAL_TRAINING_CONFIG, max_epochs=int(a.sanity_epochs))
     sanity_root = a.output_dir / "sanity"; task = write_q_task(a, row, inner, training_config=cfg, destination_base=sanity_root)
     data = load_block_sequence_session(a.project_root, str(row["session"]), HISTORICAL_TASK_NAME, data_dir=a.data_dir); validate_dot_vs_grating_data(data)
-    reconstructed = _historical_outer(a, row, data); _, historical = historical_assets(a)
-    ref = historical[(historical.session.astype(str).eq(str(row["session"]))) & (historical.seed.astype(int).eq(int(row["seed"]))) & historical.block_id.astype(str).isin(reconstructed.block_id)].sort_values("block_id").reset_index(drop=True)
-    got = reconstructed.sort_values("block_id").reset_index(drop=True)
-    probability_columns = [c for c in ("prob_dot", "prob_grating") if c in ref]
-    if len(ref) != len(got) or not probability_columns or not np.allclose(ref[probability_columns].to_numpy(float), got[probability_columns].to_numpy(float), atol=BASELINE_ATOL, rtol=1e-6): raise AssertionError("historical DG baseline reconstruction mismatch")
-    framework.atomic_json(a.output_dir / "SANITY_COMPLETE.json", {"status": "complete", "created_utc": now(), "device": "cpu", "sanity_epochs": a.sanity_epochs, "trained_inner_models": 3, "outer_final_model_trainings": 0, "task_dir": str(task), "historical_reconstruction": "PASS", "formal_full_started": False})
+    reconstructed = _historical_outer(a, row, data)
+    historical = load_historical_prediction_reference(a, require_quality_frozen=False)
+    ref = historical[(historical.session.astype(str).eq(str(row["session"]))) & (historical.seed.astype(int).eq(int(row["seed"]))) & (historical.fold.astype(int).eq(int(row["fold"]))) & historical.block_id.astype(str).isin(reconstructed.block_id)].reset_index(drop=True)
+    audit, _ = historical_reconstruction_audit(reconstructed, ref, expected_rows=len(reconstructed))
+    require_reconstruction_pass(audit)
+    framework.atomic_json(a.output_dir / "SANITY_COMPLETE.json", {"status": "complete", "created_utc": now(), "device": "cpu", "sanity_epochs": a.sanity_epochs, "trained_inner_models": 3, "outer_final_model_trainings": 0, "task_dir": str(task), "historical_inference_device": HISTORICAL_OUTER_INFERENCE_DEVICE, "historical_reconstruction": audit, "formal_full_started": False})
     print("SANITY COMPLETE cpu inner_models=3 historical_reconstruction=PASS formal_full_started=False", flush=True)
 
 
@@ -264,6 +367,46 @@ def _complete_task(path: Path, row: dict[str, Any]) -> bool:
     except Exception: return False
 
 
+def summarize_training_only_quality(
+    quality: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Seed-average within outer fold, then fold-average to one Q per session."""
+
+    required = {"session", "seed", "fold", "Q_DG_concatenated_inner_oof_block_BA"}
+    if not required.issubset(quality.columns) or quality[["session", "seed", "fold"]].duplicated().any():
+        raise AssertionError("training-only task-quality table is incomplete or duplicated")
+    if not quality.groupby(["session", "fold"]).seed.nunique().eq(len(SEEDS)).all():
+        raise AssertionError("each outer fold requires exactly three seed Q values")
+    fold_q = quality.groupby(["session", "fold"], as_index=False).Q_DG_concatenated_inner_oof_block_BA.mean().rename(columns={"Q_DG_concatenated_inner_oof_block_BA": "Q_DG_seed_averaged"})
+    session_q = fold_q.groupby("session", as_index=False).Q_DG_seed_averaged.mean().rename(columns={"Q_DG_seed_averaged": "Q_DG_session"})
+    direct_q = quality.groupby("session", as_index=False).Q_DG_concatenated_inner_oof_block_BA.mean().rename(columns={"Q_DG_concatenated_inner_oof_block_BA": "direct_mean_all_fold_seed_Q"})
+    session_q = session_q.merge(direct_q, on="session", validate="one_to_one")
+    if not np.allclose(session_q.Q_DG_session, session_q.direct_mean_all_fold_seed_Q, atol=1e-12):
+        raise AssertionError("seed-within-fold Q aggregation is not equivalent to direct mean")
+    return fold_q, session_q
+
+
+def freeze_training_only_quality(
+    a: argparse.Namespace, plan: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Aggregate completed Phase-1 tasks and atomically freeze session Q values."""
+
+    task_results = [json.loads((_task_dir(a.output_dir, row) / "result.json").read_text()) for row in plan.to_dict("records")]
+    quality = pd.DataFrame(task_results).merge(plan[["task_key", "session", "seed", "fold"]], on="task_key", validate="one_to_one")
+    inner_blocks = pd.concat([_csv(_task_dir(a.output_dir, row) / "inner_oof_predictions.csv") for row in plan.to_dict("records")], ignore_index=True)
+    completed_inner = pd.concat([_csv(_task_dir(a.output_dir, row) / "inner_split_manifest.csv") for row in plan.to_dict("records")], ignore_index=True)
+    if len(completed_inner) != EXPECTED_INNER_TRAININGS or len(inner_blocks) != 5820:
+        raise AssertionError("formal inner OOF coverage/count drift")
+    framework.atomic_csv(a.output_dir / "outer_task_quality.csv", quality)
+    framework.atomic_csv(a.output_dir / "inner_oof_manifest.csv", completed_inner)
+    framework.atomic_csv(a.output_dir / "inner_oof_predictions.csv", inner_blocks)
+    fold_q, session_q = summarize_training_only_quality(quality)
+    quality_path = a.output_dir / "session_training_only_quality.csv"
+    framework.atomic_csv(quality_path, session_q)
+    framework.atomic_json(a.output_dir / "QUALITY_FROZEN.json", {"status": "frozen_before_target_reference_load", "created_utc": now(), "session_quality_sha256": framework.file_sha256(quality_path), "target_reference_loader_guard": "requires this file and exact session-Q SHA256", "outer_test_read_before_freeze": False})
+    return quality, fold_q, session_q
+
+
 def run_full(a: argparse.Namespace) -> None:
     if not a.review_approved: raise PermissionError("formal full requires explicit --review-approved")
     plan, inner, _ = load_strict_plan(a)
@@ -271,35 +414,18 @@ def run_full(a: argparse.Namespace) -> None:
     for row in plan.to_dict("records"):
         path = _task_dir(a.output_dir, row)
         if not _complete_task(path, row): write_q_task(a, row, inner)
-    task_results = []
-    for row in plan.to_dict("records"):
-        task_results.append(json.loads((_task_dir(a.output_dir, row) / "result.json").read_text()))
-    quality = pd.DataFrame(task_results).merge(plan[["task_key", "session", "seed", "fold"]], on="task_key", validate="one_to_one")
-    inner_blocks = pd.concat([_csv(_task_dir(a.output_dir, r) / "inner_oof_predictions.csv") for r in plan.to_dict("records")], ignore_index=True)
-    completed_inner = pd.concat([_csv(_task_dir(a.output_dir, r) / "inner_split_manifest.csv") for r in plan.to_dict("records")], ignore_index=True)
-    if len(completed_inner) != EXPECTED_INNER_TRAININGS or len(inner_blocks) != 5820:
-        raise AssertionError("formal inner OOF coverage/count drift")
-    framework.atomic_csv(a.output_dir / "outer_task_quality.csv", quality); framework.atomic_csv(a.output_dir / "inner_oof_manifest.csv", completed_inner); framework.atomic_csv(a.output_dir / "inner_oof_predictions.csv", inner_blocks)
-    fold_q = quality.groupby(["session", "fold"], as_index=False).Q_DG_concatenated_inner_oof_block_BA.mean().rename(columns={"Q_DG_concatenated_inner_oof_block_BA": "Q_DG_seed_averaged"})
-    session_q = fold_q.groupby("session", as_index=False).Q_DG_seed_averaged.mean().rename(columns={"Q_DG_seed_averaged": "Q_DG_session"})
-    direct_q = quality.groupby("session", as_index=False).Q_DG_concatenated_inner_oof_block_BA.mean().rename(columns={"Q_DG_concatenated_inner_oof_block_BA": "direct_mean_all_fold_seed_Q"})
-    session_q = session_q.merge(direct_q, on="session", validate="one_to_one")
-    if not np.allclose(session_q.Q_DG_session, session_q.direct_mean_all_fold_seed_Q, atol=1e-12):
-        raise AssertionError("seed-within-fold Q aggregation is not equivalent to direct mean")
-    framework.atomic_csv(a.output_dir / "session_training_only_quality.csv", session_q)
-    framework.atomic_json(a.output_dir / "QUALITY_FROZEN.json", {"status": "frozen_before_outer_target_read", "session_quality_sha256": framework.file_sha256(a.output_dir / "session_training_only_quality.csv"), "outer_test_read_before_freeze": False, "outer_test_label_or_prediction_mutation_changes_Q": False})
+    quality, fold_q, session_q = freeze_training_only_quality(a, plan)
     # Phase 2 starts only after Q is frozen: exact historical outer checkpoint reconstruction.
     targets = []
     for row in plan.to_dict("records"):
         data = load_block_sequence_session(a.project_root, str(row["session"]), HISTORICAL_TASK_NAME, data_dir=a.data_dir); validate_dot_vs_grating_data(data); targets.append(_historical_outer(a, row, data))
-    targets = pd.concat(targets, ignore_index=True); _, reference = historical_assets(a)
-    merged = targets.merge(reference, on=["session", "seed", "block_id"], suffixes=("_reconstructed", "_historical"), validate="one_to_one")
-    comparison = np.allclose(merged[["prob_dot_reconstructed", "prob_grating_reconstructed"]], merged[["prob_dot_historical", "prob_grating_historical"]], atol=BASELINE_ATOL, rtol=1e-6)
-    if len(merged) != 684 or not comparison: raise AssertionError("formal historical outer target reconstruction mismatch")
-    framework.atomic_csv(a.output_dir / "outer_target_predictions.csv", targets); framework.atomic_json(a.output_dir / "outer_target_reconstruction_audit.json", {"status": "PASS", "rows": len(merged), "atol": BASELINE_ATOL})
-    seed_ba_rows = [{"session": str(session), "seed": int(seed), "BA_DG_seed_OOF": float(balanced_accuracy_score(group.truth, group.prediction))} for (session, seed), group in targets.groupby(["session", "seed"], sort=True)]
-    seed_ba = pd.DataFrame(seed_ba_rows)
-    target_session = seed_ba.groupby("session", as_index=False).BA_DG_seed_OOF.mean().rename(columns={"BA_DG_seed_OOF":"BA_DG_session"})
+    targets = pd.concat(targets, ignore_index=True)
+    reference = load_historical_prediction_reference(a, require_quality_frozen=True)
+    reconstruction_audit, _ = historical_reconstruction_audit(targets, reference, expected_rows=684)
+    framework.atomic_json(a.output_dir / "outer_target_reconstruction_audit.json", reconstruction_audit)
+    require_reconstruction_pass(reconstruction_audit)
+    framework.atomic_csv(a.output_dir / "outer_target_predictions.csv", targets)
+    seed_ba, target_session = session_target_from_oof(targets)
     summary = session_q.merge(target_session, on="session", validate="one_to_one")
     fold_ba_rows = [{"session": str(session), "fold": int(fold), "BA_DG_seed_averaged": float(np.mean([balanced_accuracy_score(g.truth, g.prediction) for _, g in group.groupby("seed", sort=True)]))} for (session, fold), group in targets.groupby(["session", "fold"], sort=True)]
     fold_ba = pd.DataFrame(fold_ba_rows)

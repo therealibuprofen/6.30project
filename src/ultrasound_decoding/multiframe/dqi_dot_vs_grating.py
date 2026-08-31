@@ -248,10 +248,16 @@ def leave_one_session_out(session_summary: pd.DataFrame, q_column: str, target_c
 def evaluate_confirmatory_gate(
     *, session_spearman: float, exact_p: float, loo_median: float, loo_minimum: float
 ) -> dict[str, Any]:
+    observed_values = np.asarray(
+        [session_spearman, exact_p, loo_median, loo_minimum], dtype=np.float64
+    )
+    finite = bool(np.isfinite(observed_values).all())
     passes = {
-        "A": float(session_spearman) >= FROZEN_CONFIRMATORY_GATE["A_session_spearman_min"],
-        "B": float(exact_p) <= FROZEN_CONFIRMATORY_GATE["B_exact_two_sided_permutation_p_max"],
+        "A": finite and float(session_spearman) >= FROZEN_CONFIRMATORY_GATE["A_session_spearman_min"],
+        "B": finite and float(exact_p) <= FROZEN_CONFIRMATORY_GATE["B_exact_two_sided_permutation_p_max"],
         "C": (
+            finite
+            and
             float(loo_median) >= FROZEN_CONFIRMATORY_GATE["C_loo_median_spearman_min"]
             and float(loo_minimum) > FROZEN_CONFIRMATORY_GATE["C_loo_min_spearman_strictly_above"]
         ),
@@ -265,6 +271,7 @@ def evaluate_confirmatory_gate(
             "loo_minimum_spearman": float(loo_minimum),
         },
         "passes": passes,
+        "all_observed_statistics_finite": finite,
         "decision": (
             "supports_cross_task_DQI_validation_dot_vs_grating"
             if all(passes.values())

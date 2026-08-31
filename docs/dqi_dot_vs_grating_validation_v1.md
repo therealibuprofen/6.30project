@@ -6,6 +6,8 @@ The target is clean4 dot-versus-grating decoding only: dot is class 0 and gratin
 
 Formal execution freezes all nine session `Q_DG` values before reading or reconstructing any outer-test target. It then reconstructs every historical outer prediction from the validated checkpoint and saved outer-train normalization; a mismatch against the provenance-validated historical aggregate aborts the run.
 
+The pre-freeze phase reads checkpoint metadata and may hash the opaque historical prediction file, but it cannot parse that prediction table. The Phase-2 loader requires `QUALITY_FROZEN.json` plus an exact hash match to the frozen session-Q table. Historical checkpoint reconstruction is explicitly CPU-only even when the 738 inner models are trained with CUDA, so model and input devices cannot diverge.
+
 The only confirmatory relationship is session-level `Q_DG` versus historical session-level DG BA. The gate requires Spearman rho >= .75, exhaustive two-sided 9! permutation p <= .05, LOSO median rho >= .65, and LOSO minimum rho > .30. Presence/DG cross-task relationships, fold-level associations, and within-session correlations are descriptive only and never enter the gate.
 
 Run plan, then CPU sanity:

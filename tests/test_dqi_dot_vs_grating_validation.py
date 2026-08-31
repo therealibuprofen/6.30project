@@ -3,12 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
+from scripts.baselines import run_dqi_dot_vs_grating_validation as runner
 from ultrasound_decoding.multiframe.cycle_calibrated_late_fusion import (
     FORMAL_TRAINING_CONFIG, build_inner_cache_key, build_task_inner_cache_key,
 )
 from ultrasound_decoding.multiframe.dqi_dot_vs_grating import (
-    TASK_NAME, block_predictions_from_frame_logits,
+    TASK_NAME, block_predictions_from_frame_logits, build_inner_manifest,
     concatenated_oof_balanced_accuracy, cross_task_relationship_matrix,
     evaluate_confirmatory_gate, exact_spearman_permutation, leave_one_session_out,
     mean_inner_fold_ba_diagnostic, validate_authoritative_mapping,
@@ -69,3 +71,112 @@ def test_oof_rejects_duplicate_frame_or_not_four_frames() -> None:
         block_predictions_from_frame_logits(pd.concat([rows, rows.iloc[[0]]], ignore_index=True))
     with pytest.raises(AssertionError):
         block_predictions_from_frame_logits(rows.iloc[1:].copy())
+
+
+def test_plan_and_q_phase_do_not_call_historical_target_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("historical target prediction reference was semantically loaded")
+
+    monkeypatch.setattr(runner, "load_historical_prediction_reference", forbidden)
+    quality = pd.DataFrame(
+        [
+            {"session": session, "seed": seed, "fold": fold, "Q_DG_concatenated_inner_oof_block_BA": 0.5 + 0.01 * fold}
+            for session in ("626", "628")
+            for fold in (1, 2)
+            for seed in (0, 1, 2)
+        ]
+    )
+    fold_q, session_q = runner.summarize_training_only_quality(quality)
+    assert len(fold_q) == 4
+    assert len(session_q) == 2
+
+
+def test_quality_frozen_guard_precedes_target_reference_load(tmp_path: pytest.TempPathFactory) -> None:
+    output = tmp_path / "output"
+    aggregate = tmp_path / "aggregate"
+    output.mkdir()
+    aggregate.mkdir()
+    reference = pd.DataFrame(
+        [{"session": "626", "task": "stimulus_type", "method": "fcnn_late_fusion", "seed": 0, "fold": 1, "block_id": f"b{i}", "truth": i % 2, "pred": i % 2, "prob_dot": 0.8 if i % 2 == 0 else 0.2, "prob_grating": 0.2 if i % 2 == 0 else 0.8} for i in range(684)]
+    )
+    reference.to_csv(aggregate / "multiframe_all_models_predictions.csv", index=False)
+    args = type("Args", (), {"output_dir": output, "historical_aggregate_dir": aggregate})()
+    with pytest.raises(RuntimeError, match="locked until Q_DG is frozen"):
+        runner.load_historical_prediction_reference(args, require_quality_frozen=True)
+    quality = output / "session_training_only_quality.csv"
+    pd.DataFrame({"session": ["626"], "Q_DG_session": [0.5]}).to_csv(quality, index=False)
+    runner.framework.atomic_json(output / "QUALITY_FROZEN.json", {"status": "frozen_before_target_reference_load", "session_quality_sha256": runner.framework.file_sha256(quality)})
+    loaded = runner.load_historical_prediction_reference(args, require_quality_frozen=True)
+    assert len(loaded) == 684
+
+
+def test_historical_outer_inference_is_explicitly_cpu_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = torch.nn.Linear(1, 1)
+    payload = {"normalization_mean": np.zeros((1, 128, 501), np.float32), "normalization_std": np.ones((1, 128, 501), np.float32)}
+    monkeypatch.setattr(runner, "load_validated_checkpoint", lambda *args, **kwargs: (model, payload, {}))
+    monkeypatch.setattr(runner, "_indices", lambda data, row: (np.array([], dtype=int), np.array([0], dtype=int)))
+    seen: dict[str, str] = {}
+    def fake_predict(model: torch.nn.Module, blocks: np.ndarray, *, device: str, batch_size: int) -> np.ndarray:
+        seen["device"] = str(device)
+        assert {parameter.device.type for parameter in model.parameters()} == {"cpu"}
+        return np.zeros((4, 2), dtype=float)
+    monkeypatch.setattr(runner, "predict_raw_logits", fake_predict)
+    data = type("Data", (), {"X": np.zeros((1, 4, 128, 501), np.float32), "y": np.array([0]), "metadata": pd.DataFrame({"block_id": ["b0"]})})()
+    row = {"session": "626", "seed": 0, "fold": 1, "outer_train_cycles": "1", "outer_test_cycles": "2", "historical_checkpoint_path": "unused", "historical_checkpoint_sha256": "sha"}
+    args = type("Args", (), {"device": "cuda", "inference_batch_size": 64})()
+    runner._historical_outer(args, row, data)
+    assert seen["device"] == "cpu"
+
+
+def _reconstruction_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    reconstructed = pd.DataFrame({"session": ["626", "626"], "seed": [0, 0], "fold": [1, 1], "block_id": ["dot", "grating"], "truth": [0, 1], "prediction": [0, 1], "prob_dot": [0.8, 0.2], "prob_grating": [0.2, 0.8]})
+    reference = reconstructed.rename(columns={"prediction": "pred"}).copy()
+    return reconstructed, reference
+
+
+@pytest.mark.parametrize("column,value", [("truth", 1), ("pred", 1), ("prob_dot", 0.1)])
+def test_historical_reconstruction_mismatch_stops(column: str, value: float) -> None:
+    reconstructed, reference = _reconstruction_frames()
+    reference.loc[0, column] = value
+    audit, _ = runner.historical_reconstruction_audit(reconstructed, reference, expected_rows=2)
+    assert audit["status"] == "FAIL"
+    with pytest.raises(AssertionError):
+        runner.require_reconstruction_pass(audit)
+
+
+def test_validation_mutation_is_real_and_cannot_change_train_normalization() -> None:
+    rng = np.random.default_rng(4)
+    blocks = rng.normal(size=(3, 4, 128, 501)).astype(np.float32)
+    audit = runner.validation_mutation_normalization_audit(blocks, np.array([0, 1]), np.array([2]))
+    assert audit["validation_pixels_actually_changed"]
+    assert audit["train_pixels_unchanged"]
+    assert audit["normalization_arrays_unchanged"]
+    assert audit["normalization_fingerprint_before"] == audit["normalization_fingerprint_after"]
+
+
+def test_planning_invariants_are_246_outer_tasks_and_738_inner_splits() -> None:
+    rows = []
+    for task_i in range(246):
+        rows.append({"task_key": f"t{task_i}", "task_fingerprint": f"fp{task_i}", "session": "626", "seed": task_i % 3, "fold": task_i // 3 + 1, "outer_train_cycles": "1,2,3", "outer_test_cycles": "4"})
+    manifest = build_inner_manifest(pd.DataFrame(rows), "protocol", "source")
+    assert len(rows) == 246
+    assert len(manifest) == 738
+    assert manifest.groupby("task_key").inner_fold.nunique().eq(3).all()
+
+
+def test_formal_session_target_is_seed_oof_ba_then_mean() -> None:
+    rows = []
+    # Seed BAs are 1.0, 0.5 and 0.0; formal session target must be 0.5.
+    predictions = ((0, 1), (0, 0), (1, 0))
+    for seed, (pred0, pred1) in enumerate(predictions):
+        rows.extend([{"session": "626", "seed": seed, "truth": 0, "prediction": pred0}, {"session": "626", "seed": seed, "truth": 1, "prediction": pred1}])
+    seed_ba, session = runner.session_target_from_oof(pd.DataFrame(rows))
+    assert seed_ba.BA_DG_seed_OOF.tolist() == pytest.approx([1.0, 0.5, 0.0])
+    assert session.iloc[0].BA_DG_session == pytest.approx(0.5)
+
+
+def test_nonfinite_loso_cannot_pass_gate() -> None:
+    gate = evaluate_confirmatory_gate(session_spearman=0.9, exact_p=0.01, loo_median=np.nan, loo_minimum=0.8)
+    assert not gate["all_observed_statistics_finite"]
+    assert gate["decision"] == "does_not_support_cross_task_DQI_validation_dot_vs_grating"
+    assert not any(gate["passes"].values())
