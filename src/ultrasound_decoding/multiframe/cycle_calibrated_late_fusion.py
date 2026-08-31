@@ -227,6 +227,47 @@ def build_inner_cache_key(
     )
 
 
+def build_task_inner_cache_key(
+    *,
+    task: str,
+    session: str,
+    outer_fold: int,
+    outer_seed: int,
+    outer_train_cycles: Sequence[int],
+    inner_fold: int,
+    inner_train_cycles: Sequence[int],
+    inner_validation_cycles: Sequence[int],
+    source_hash: str,
+    protocol_hash: str,
+    normalization_fingerprint: str,
+    training_config: Mapping[str, Any],
+) -> str:
+    """Task-explicit cache identity for cross-task reuse of the approved inner CV."""
+
+    if not str(task).strip():
+        raise ValueError("task must be nonempty")
+    required_strings = (source_hash, protocol_hash, normalization_fingerprint)
+    if any(not str(value).strip() for value in required_strings):
+        raise ValueError("cache identity hashes must be nonempty")
+    return fingerprint(
+        {
+            "task": str(task),
+            "session": str(session),
+            "outer_fold": int(outer_fold),
+            "outer_seed": int(outer_seed),
+            "outer_train_cycles": list(parse_cycle_ids(outer_train_cycles)),
+            "inner_fold": int(inner_fold),
+            "inner_train_cycles": list(parse_cycle_ids(inner_train_cycles)),
+            "inner_validation_cycles": list(parse_cycle_ids(inner_validation_cycles)),
+            "source_hash": str(source_hash),
+            "protocol_hash": str(protocol_hash),
+            "normalization_fingerprint": str(normalization_fingerprint),
+            "model": "MaxPool2d-Flatten-Linear16000x3-ReLU-Linear3x2",
+            "training_config": dict(training_config),
+        }
+    )
+
+
 def predict_raw_logits(
     model: torch.nn.Module,
     normalized_blocks: np.ndarray,

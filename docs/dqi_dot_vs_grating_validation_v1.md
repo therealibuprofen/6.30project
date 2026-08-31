@@ -1,0 +1,22 @@
+# DQI / Q_dec Cross-Task Confirmatory Validation v1
+
+The target is clean4 dot-versus-grating decoding only: dot is class 0 and grating is class 1. Historical outer FCNN checkpoints and their cycle folds are reused exactly. No outer model is trained.
+
+`Q_DG` is generated with three deterministic cycle-grouped inner folds inside each historical outer-training set. Each inner model uses only its inner-training frames for arcsinh/pixel z-score normalization and runs the historical 40-epoch FCNN protocol. Its raw logits are converted to probabilities and the four frame probabilities are averaged per block. The formal task quality is BA on all concatenated inner-OOF blocks, not a mean of inner-fold BAs.
+
+Formal execution freezes all nine session `Q_DG` values before reading or reconstructing any outer-test target. It then reconstructs every historical outer prediction from the validated checkpoint and saved outer-train normalization; a mismatch against the provenance-validated historical aggregate aborts the run.
+
+The only confirmatory relationship is session-level `Q_DG` versus historical session-level DG BA. The gate requires Spearman rho >= .75, exhaustive two-sided 9! permutation p <= .05, LOSO median rho >= .65, and LOSO minimum rho > .30. Presence/DG cross-task relationships, fold-level associations, and within-session correlations are descriptive only and never enter the gate.
+
+Run plan, then CPU sanity:
+
+```bash
+PYTHONPATH=src python scripts/baselines/run_dqi_dot_vs_grating_validation.py --stage plan --project-root /data2/yuq1ngr/6.30project --output-dir outputs/dqi_dot_vs_grating_validation_v1
+CUDA_VISIBLE_DEVICES= PYTHONPATH=src python scripts/baselines/run_dqi_dot_vs_grating_validation.py --stage sanity --project-root /data2/yuq1ngr/6.30project --output-dir outputs/dqi_dot_vs_grating_validation_v1 --device cpu --sanity-epochs 1
+```
+
+Formal full execution is intentionally guarded and was not run during code review:
+
+```bash
+PYTHONPATH=src python scripts/baselines/run_dqi_dot_vs_grating_validation.py --stage full --project-root /data2/yuq1ngr/6.30project --output-dir outputs/dqi_dot_vs_grating_validation_v1 --device cuda --review-approved
+```

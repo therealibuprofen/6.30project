@@ -1,0 +1,12 @@
+{
+  "output_version": "dqi_dot_vs_grating_validation_v1",
+  "task": "dot_vs_grating",
+  "historical_task": "stimulus_type",
+  "mapping": {"0": "dot", "1": "grating"},
+  "seeds": [0, 1, 2],
+  "outer_folds": 82,
+  "inner_cycle_folds": 3,
+  "inner_training_epochs": 40,
+  "outer_final_model_trainings": 0,
+  "gate": {"spearman_rho_min": 0.75, "exact_p_max": 0.05, "loo_median_min": 0.65, "loo_min_strictly_above": 0.30}
+}

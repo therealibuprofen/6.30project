@@ -159,6 +159,7 @@ def validate_checkpoint_payload(
     expected_fold: int,
     expected_train_cycles: str,
     expected_test_cycles: str,
+    expected_task: str = "binary",
 ) -> dict[str, Any]:
     """Validate all scientific/provenance fields needed for reconstruction."""
 
@@ -173,7 +174,7 @@ def validate_checkpoint_payload(
         "session": str(payload.get("session")) == str(expected_session),
         "seed": int(payload.get("seed", -1)) == int(expected_seed),
         "fold": int(payload.get("fold", -1)) == int(expected_fold),
-        "task": payload.get("task") == "binary",
+        "task": payload.get("task") == str(expected_task),
         "classes": list(payload.get("classes", [])) == EXPECTED_CLASSES,
         "max_epochs": int(payload.get("max_epochs", -1)) == EXPECTED_EPOCH,
         "final_epoch": int(payload.get("final_epoch", -1)) == EXPECTED_EPOCH,
@@ -234,6 +235,7 @@ def load_validated_checkpoint(
     expected_fold: int,
     expected_train_cycles: str,
     expected_test_cycles: str,
+    expected_task: str = "binary",
 ) -> tuple[nn.Module, dict[str, Any], dict[str, Any]]:
     checkpoint_path = Path(path)
     observed_sha256 = file_sha256(checkpoint_path)
@@ -250,6 +252,7 @@ def load_validated_checkpoint(
         expected_fold=expected_fold,
         expected_train_cycles=expected_train_cycles,
         expected_test_cycles=expected_test_cycles,
+        expected_task=expected_task,
     )
     model = FCNN(input_shape=EXPECTED_IMAGE_SHAPE, n_classes=2)
     model.load_state_dict(payload["model_state_dict"], strict=True)
