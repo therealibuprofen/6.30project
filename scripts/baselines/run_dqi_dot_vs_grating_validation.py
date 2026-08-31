@@ -9,8 +9,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+import hashlib
+from importlib import metadata as importlib_metadata
 import json
+import os
 from pathlib import Path
+import platform
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -25,7 +30,6 @@ for item in (PROJECT_DIR, PROJECT_DIR / "src"):
     if str(item) not in sys.path:
         sys.path.insert(0, str(item))
 
-from scripts.baselines import run_multiscale_temporal1d as framework
 from ultrasound_decoding.multiframe.canonical_single_frame import (
     NORMALIZATION_TRANSFORM, apply_saved_normalization, load_validated_checkpoint,
 )
@@ -50,6 +54,52 @@ BASELINE_ATOL = 2e-6
 HISTORICAL_OUTER_INFERENCE_DEVICE = "cpu"
 REQUIRED_TASK_FILES = ("result.json", "inner_split_manifest.csv", "inner_training_summary.csv", "inner_oof_logits.csv", "inner_oof_predictions.csv", "leakage_audit.json")
 REQUIRED_RUN_OUTPUTS = ("DQI_DOT_VS_GRATING_VALIDATION.md", "config.json", "runtime_fingerprint.json", "task_plan.csv", "inner_split_manifest.csv", "historical_fcnn_checkpoint_manifest.csv", "inner_oof_manifest.csv", "outer_task_quality.csv", "inner_oof_predictions.csv", "outer_fold_seed_averaged.csv", "within_session_fold_relationship.csv", "session_quality_summary.csv", "QUALITY_FROZEN.json", "outer_target_predictions.csv", "outer_target_reconstruction_audit.json", "loo_robustness.csv", "cross_task_relationship_matrix.csv", "statistical_audit.json", "provenance_audit.json")
+
+
+class _AtomicProvenanceIO:
+    """Small self-contained subset of the approved runner I/O utilities."""
+
+    @staticmethod
+    def file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def atomic_json(path: Path, value: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def atomic_text(path: Path, value: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(value, encoding="utf-8")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        frame.to_csv(temporary, index=False)
+        os.replace(temporary, path)
+
+    @staticmethod
+    def runtime_environment_signature() -> dict[str, str]:
+        packages: dict[str, str] = {}
+        for package in ("numpy", "pandas", "scipy", "scikit-learn", "torch", "h5py"):
+            try:
+                packages[package] = importlib_metadata.version(package)
+            except importlib_metadata.PackageNotFoundError:
+                packages[package] = "not-installed"
+        return {"python": platform.python_version(), "platform": platform.platform(), "hostname": socket.gethostname(), **packages}
+
+
+framework = _AtomicProvenanceIO()
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +138,7 @@ def formal_protocol() -> dict[str, Any]:
 
 
 def source_paths(root: Path) -> list[Path]:
-    return [Path(__file__).resolve(), root / "src/ultrasound_decoding/multiframe/dqi_dot_vs_grating.py", root / "src/ultrasound_decoding/multiframe/cycle_calibrated_late_fusion.py", root / "src/ultrasound_decoding/multiframe/canonical_single_frame.py", root / "src/ultrasound_decoding/multiframe/training.py", root / "src/ultrasound_decoding/multiframe/models.py", root / "src/ultrasound_decoding/multiframe/dataset.py", root / "src/ultrasound_decoding/deep.py", root / "src/ultrasound_decoding/evaluate.py", root / "scripts/baselines/run_multiscale_temporal1d.py", root / "configs/dqi_dot_vs_grating_validation_v1.json", root / "docs/dqi_dot_vs_grating_validation_v1.md"]
+    return [Path(__file__).resolve(), root / "src/ultrasound_decoding/multiframe/dqi_dot_vs_grating.py", root / "src/ultrasound_decoding/multiframe/cycle_calibrated_late_fusion.py", root / "src/ultrasound_decoding/multiframe/canonical_single_frame.py", root / "src/ultrasound_decoding/multiframe/training.py", root / "src/ultrasound_decoding/multiframe/models.py", root / "src/ultrasound_decoding/multiframe/dataset.py", root / "src/ultrasound_decoding/deep.py", root / "src/ultrasound_decoding/evaluate.py", root / "configs/dqi_dot_vs_grating_validation_v1.json", root / "docs/dqi_dot_vs_grating_validation_v1.md"]
 
 
 def source_identity(a: argparse.Namespace) -> dict[str, Any]:
