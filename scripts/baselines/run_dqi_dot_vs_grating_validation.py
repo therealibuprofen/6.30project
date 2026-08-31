@@ -32,6 +32,7 @@ for item in (PROJECT_DIR, PROJECT_DIR / "src"):
 
 from ultrasound_decoding.multiframe.canonical_single_frame import (
     NORMALIZATION_TRANSFORM, apply_saved_normalization, load_validated_checkpoint,
+    validate_checkpoint_payload,
 )
 from ultrasound_decoding.multiframe.cycle_calibrated_late_fusion import (
     FORMAL_TRAINING_CONFIG, FRAMES_PER_BLOCK, assert_complete_inner_oof,
@@ -53,7 +54,7 @@ from ultrasound_decoding.multiframe.dqi_dot_vs_grating import (
 BASELINE_ATOL = 2e-6
 HISTORICAL_OUTER_INFERENCE_DEVICE = "cpu"
 REQUIRED_TASK_FILES = ("result.json", "inner_split_manifest.csv", "inner_training_summary.csv", "inner_oof_logits.csv", "inner_oof_predictions.csv", "leakage_audit.json")
-REQUIRED_RUN_OUTPUTS = ("DQI_DOT_VS_GRATING_VALIDATION.md", "config.json", "runtime_fingerprint.json", "task_plan.csv", "inner_split_manifest.csv", "historical_fcnn_checkpoint_manifest.csv", "inner_oof_manifest.csv", "outer_task_quality.csv", "inner_oof_predictions.csv", "outer_fold_seed_averaged.csv", "within_session_fold_relationship.csv", "session_quality_summary.csv", "QUALITY_FROZEN.json", "outer_target_predictions.csv", "outer_target_reconstruction_audit.json", "loo_robustness.csv", "cross_task_relationship_matrix.csv", "statistical_audit.json", "provenance_audit.json")
+REQUIRED_RUN_OUTPUTS = ("DQI_DOT_VS_GRATING_VALIDATION.md", "config.json", "runtime_fingerprint.json", "task_plan.csv", "inner_split_manifest.csv", "historical_fcnn_checkpoint_manifest.csv", "historical_checkpoint_preflight.json", "inner_oof_manifest.csv", "outer_task_quality.csv", "inner_oof_predictions.csv", "outer_fold_seed_averaged.csv", "within_session_fold_relationship.csv", "session_training_only_quality.csv", "session_quality_summary.csv", "QUALITY_FROZEN.json", "outer_target_predictions.csv", "outer_target_reconstruction_audit.json", "loo_robustness.csv", "cross_task_relationship_matrix.csv", "statistical_audit.json", "provenance_audit.json")
 
 
 class _AtomicProvenanceIO:
@@ -245,6 +246,71 @@ def load_strict_plan(a: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame,
     runtime = json.loads((a.output_dir / "runtime_fingerprint.json").read_text())
     if runtime.get("run_fingerprint") != meta["run_fingerprint"] or runtime.get("source_hashes") != meta["identity"]["source_hashes"]: raise AssertionError("plan provenance changed")
     return plan, inner, meta
+
+
+def historical_checkpoint_preflight(
+    a: argparse.Namespace,
+    plan: pd.DataFrame,
+    *,
+    expected_count: int = EXPECTED_OUTER_TASKS,
+) -> dict[str, Any]:
+    """Validate every historical outer checkpoint on CPU before Phase 1 starts."""
+
+    expected = int(expected_count)
+    found = sha_match = loadable = metadata_match = 0
+    failures: list[dict[str, Any]] = []
+    if len(plan) != expected or plan[["session", "seed", "fold"]].duplicated().any():
+        failures.append({"task_key": "plan", "error": f"expected {expected} unique tasks, found {len(plan)}"})
+    for row in plan.sort_values(["session", "seed", "fold"]).to_dict("records"):
+        task_key = str(row.get("task_key", f"{row['session']}:{row['seed']}:{row['fold']}"))
+        path = Path(row["historical_checkpoint_path"])
+        if not path.is_file():
+            failures.append({"task_key": task_key, "error": "checkpoint_missing", "path": str(path)})
+            continue
+        found += 1
+        observed_sha = framework.file_sha256(path)
+        if observed_sha == str(row["historical_checkpoint_sha256"]):
+            sha_match += 1
+        else:
+            failures.append({"task_key": task_key, "error": "checkpoint_sha256_mismatch", "path": str(path), "observed_sha256": observed_sha})
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            loadable += 1
+        except Exception as exc:
+            failures.append({"task_key": task_key, "error": "checkpoint_not_loadable", "path": str(path), "detail": str(exc)})
+            continue
+        try:
+            validate_checkpoint_payload(
+                payload,
+                expected_session=str(row["session"]),
+                expected_seed=int(row["seed"]),
+                expected_fold=int(row["fold"]),
+                expected_train_cycles=str(row["outer_train_cycles"]),
+                expected_test_cycles=str(row["outer_test_cycles"]),
+                expected_task=HISTORICAL_TASK_NAME,
+            )
+            metadata_match += 1
+        except Exception as exc:
+            failures.append({"task_key": task_key, "error": "checkpoint_metadata_mismatch", "path": str(path), "detail": str(exc)})
+    passed = len(plan) == expected and found == expected and sha_match == expected and loadable == expected and metadata_match == expected
+    audit = {
+        "expected": expected,
+        "found": found,
+        "sha_match": sha_match,
+        "loadable": loadable,
+        "metadata_match": metadata_match,
+        "inference_performed": False,
+        "validation_device": "cpu",
+        "failures": failures,
+        "status": "PASS" if passed else "FAIL",
+    }
+    framework.atomic_json(a.output_dir / "historical_checkpoint_preflight.json", audit)
+    if not passed:
+        raise RuntimeError(f"historical checkpoint preflight failed before Phase 1: {audit}")
+    return audit
 
 
 def _indices(data: Any, row: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -457,9 +523,39 @@ def freeze_training_only_quality(
     return quality, fold_q, session_q
 
 
+def aggregate_artifact_sha256(output_dir: Path) -> dict[str, str]:
+    missing = [name for name in REQUIRED_RUN_OUTPUTS if not (output_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"formal aggregate artifacts missing: {missing}")
+    return {name: framework.file_sha256(output_dir / name) for name in REQUIRED_RUN_OUTPUTS}
+
+
+def validate_quality_frozen_integrity(output_dir: Path) -> None:
+    frozen_path = output_dir / "QUALITY_FROZEN.json"
+    quality_path = output_dir / "session_training_only_quality.csv"
+    if not frozen_path.is_file() or not quality_path.is_file():
+        raise AssertionError("frozen-Q integrity artifacts are missing")
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    observed = framework.file_sha256(quality_path)
+    if frozen.get("session_quality_sha256") != observed:
+        raise AssertionError("frozen-Q integrity failed: session_training_only_quality.csv SHA256 changed")
+
+
+def validate_completed_run_integrity(output_dir: Path, completion: dict[str, Any]) -> None:
+    validate_quality_frozen_integrity(output_dir)
+    expected = completion.get("aggregate_artifact_sha256")
+    if not isinstance(expected, dict) or set(expected) != set(REQUIRED_RUN_OUTPUTS):
+        raise AssertionError("RUN_COMPLETE aggregate artifact mapping is incomplete")
+    observed = aggregate_artifact_sha256(output_dir)
+    changed = sorted(name for name in REQUIRED_RUN_OUTPUTS if observed[name] != expected[name])
+    if changed:
+        raise AssertionError(f"RUN INVALID aggregate integrity failed: {changed}")
+
+
 def run_full(a: argparse.Namespace) -> None:
     if not a.review_approved: raise PermissionError("formal full requires explicit --review-approved")
     plan, inner, _ = load_strict_plan(a)
+    historical_checkpoint_preflight(a, plan)
     # Phase 1: only outer-training data are accessed.
     for row in plan.to_dict("records"):
         path = _task_dir(a.output_dir, row)
@@ -490,16 +586,17 @@ def run_full(a: argparse.Namespace) -> None:
     summary = summary.merge(presence[["session", "Q_presence_session", "BA_presence_session"]], on="session", validate="one_to_one")
     framework.atomic_csv(a.output_dir / "session_quality_summary.csv", summary); framework.atomic_csv(a.output_dir / "loo_robustness.csv", loso); framework.atomic_csv(a.output_dir / "cross_task_relationship_matrix.csv", cross_task_relationship_matrix(summary))
     framework.atomic_json(a.output_dir / "statistical_audit.json", {"primary": {"spearman_rho": rho, "pearson_r": pearson, "exact_permutation": exact.as_dict(), "gate": gate}, "chance_BA": .5, "Q_DG_distribution": {"mean": float(summary.Q_DG_session.mean()), "sd": float(summary.Q_DG_session.std(ddof=1)), "minimum": float(summary.Q_DG_session.min()), "median": float(summary.Q_DG_session.median()), "maximum": float(summary.Q_DG_session.max())}, "formal_DG_BA_distribution": {"mean": float(summary.BA_DG_session.mean()), "sd": float(summary.BA_DG_session.std(ddof=1)), "minimum": float(summary.BA_DG_session.min()), "median": float(summary.BA_DG_session.median()), "maximum": float(summary.BA_DG_session.max())}, "descriptive_only": {"fold_level_pearson": finite_pearson(outer_fold.Q_DG_seed_averaged, outer_fold.BA_DG_seed_averaged), "fold_level_spearman": finite_spearman(outer_fold.Q_DG_seed_averaged, outer_fold.BA_DG_seed_averaged), "within_session": "not confirmatory"}})
-    framework.atomic_json(a.output_dir / "provenance_audit.json", {"quality_frozen_before_outer_target_read": True, "outer_final_model_trainings": 0, "historical_outer_run_path": str(a.historical_aggregate_dir), "checkpoint_manifest_sha256": framework.file_sha256(a.historical_aggregate_dir / "checkpoint_manifest.csv"), "historical_aggregate_sha256": framework.file_sha256(a.historical_aggregate_dir / "multiframe_all_models_predictions.csv"), "reconstructed_prediction_sha256": framework.file_sha256(a.output_dir / "outer_target_predictions.csv"), "inner_split_manifest_sha256": framework.file_sha256(a.output_dir / "inner_oof_manifest.csv"), "inner_oof_asset_sha256": framework.file_sha256(a.output_dir / "inner_oof_predictions.csv"), "formal_target_frozen_sha256": framework.file_sha256(a.output_dir / "outer_target_predictions.csv"), "presence_Q_source_sha256": framework.file_sha256(a.presence_audit_dir / "session_quality_summary.csv"), "historical_outer_checkpoint_reconstruction": "PASS", "mapping": CLASS_NAMES})
-    hashes = {name: framework.file_sha256(a.output_dir / name) for name in REQUIRED_RUN_OUTPUTS if (a.output_dir / name).is_file()}
+    framework.atomic_json(a.output_dir / "provenance_audit.json", {"quality_frozen_before_outer_target_read": True, "outer_final_model_trainings": 0, "historical_outer_run_path": str(a.historical_aggregate_dir), "checkpoint_manifest_sha256": framework.file_sha256(a.historical_aggregate_dir / "checkpoint_manifest.csv"), "historical_aggregate_sha256": framework.file_sha256(a.historical_aggregate_dir / "multiframe_all_models_predictions.csv"), "reconstructed_prediction_sha256": framework.file_sha256(a.output_dir / "outer_target_predictions.csv"), "planned_inner_split_manifest_sha256": framework.file_sha256(a.output_dir / "inner_split_manifest.csv"), "completed_inner_split_manifest_sha256": framework.file_sha256(a.output_dir / "inner_oof_manifest.csv"), "inner_oof_asset_sha256": framework.file_sha256(a.output_dir / "inner_oof_predictions.csv"), "formal_target_frozen_sha256": framework.file_sha256(a.output_dir / "outer_target_predictions.csv"), "presence_Q_source_sha256": framework.file_sha256(a.presence_audit_dir / "session_quality_summary.csv"), "historical_outer_checkpoint_reconstruction": "PASS", "historical_checkpoint_preflight": "PASS", "mapping": CLASS_NAMES})
+    validate_quality_frozen_integrity(a.output_dir)
+    hashes = aggregate_artifact_sha256(a.output_dir)
     framework.atomic_json(a.output_dir / "RUN_COMPLETE.json", {"status": "complete", "created_utc": now(), "aggregate_artifact_sha256": hashes, "gate": gate})
 
 
 def run_status(a: argparse.Namespace) -> None:
     plan, _, _ = load_strict_plan(a); complete = a.output_dir / "RUN_COMPLETE.json"
     if complete.is_file():
-        record = json.loads(complete.read_text()); expected = record.get("aggregate_artifact_sha256", {}); bad = [n for n, h in expected.items() if not (a.output_dir / n).is_file() or framework.file_sha256(a.output_dir / n) != h]
-        if bad: raise AssertionError(f"RUN INVALID aggregate integrity failed: {bad}")
+        record = json.loads(complete.read_text())
+        validate_completed_run_integrity(a.output_dir, record)
         print("STATUS complete integrity=PASS", flush=True); return
     done = sum(_complete_task(_task_dir(a.output_dir, r), r) for r in plan.to_dict("records"))
     print(f"STATUS planned={len(plan)} completed_Q_tasks={done} formal_complete=False", flush=True)

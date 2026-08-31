@@ -8,6 +8,8 @@ Formal execution freezes all nine session `Q_DG` values before reading or recons
 
 The pre-freeze phase reads checkpoint metadata and may hash the opaque historical prediction file, but it cannot parse that prediction table. The Phase-2 loader requires `QUALITY_FROZEN.json` plus an exact hash match to the frozen session-Q table. Historical checkpoint reconstruction is explicitly CPU-only even when the 738 inner models are trained with CUDA, so model and input devices cannot diverge.
 
+Before any Phase-1 inner training, formal full performs a CPU-only 246/246 checkpoint preflight covering existence, manifest SHA256, loadability, task/session/seed/fold and cycle membership, classes, and the frozen FCNN architecture. A single failure writes a failed `historical_checkpoint_preflight.json` and aborts before the first inner model. `RUN_COMPLETE.json` is written only when every required aggregate exists and is hashed; status also revalidates the frozen session-Q SHA256.
+
 The only confirmatory relationship is session-level `Q_DG` versus historical session-level DG BA. The gate requires Spearman rho >= .75, exhaustive two-sided 9! permutation p <= .05, LOSO median rho >= .65, and LOSO minimum rho > .30. Presence/DG cross-task relationships, fold-level associations, and within-session correlations are descriptive only and never enter the gate.
 
 Run plan, then CPU sanity:

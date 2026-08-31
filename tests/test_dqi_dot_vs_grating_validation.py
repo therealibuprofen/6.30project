@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
 from scripts.baselines import run_dqi_dot_vs_grating_validation as runner
+from ultrasound_decoding.deep import FCNN
 from ultrasound_decoding.multiframe.cycle_calibrated_late_fusion import (
     FORMAL_TRAINING_CONFIG, build_inner_cache_key, build_task_inner_cache_key,
 )
@@ -180,3 +182,74 @@ def test_nonfinite_loso_cannot_pass_gate() -> None:
     assert not gate["all_observed_statistics_finite"]
     assert gate["decision"] == "does_not_support_cross_task_DQI_validation_dot_vs_grating"
     assert not any(gate["passes"].values())
+
+
+def _valid_dg_checkpoint_payload() -> dict[str, object]:
+    model = FCNN(input_shape=(128, 501), n_classes=2)
+    return {
+        "method": "fcnn_late_fusion",
+        "model_config": {"base_model": "official_single_frame_FCNN", "late_fusion_probability_average": True, "temporal_length": 4},
+        "model_parameters": 48_011,
+        "model_state_dict": model.state_dict(),
+        "classes": [0, 1],
+        "session": "626",
+        "task": "stimulus_type",
+        "seed": 0,
+        "fold": 1,
+        "train_cycles": "1,2,3",
+        "test_cycles": "4",
+        "max_epochs": 40,
+        "final_epoch": 40,
+        "normalization_mean": np.zeros((1, 128, 501), dtype=np.float32),
+        "normalization_std": np.ones((1, 128, 501), dtype=np.float32),
+        "normalization_transform": "arcsinh_then_train_pixel_zscore",
+        "input_shape": [4, 128, 501],
+        "code_version": "test",
+    }
+
+
+@pytest.mark.parametrize("failure_mode", ["missing", "corrupt", "metadata_mismatch"])
+def test_checkpoint_preflight_failure_prevents_phase1(tmp_path: Path, failure_mode: str) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    if failure_mode == "corrupt":
+        checkpoint.write_bytes(b"not a torch checkpoint")
+    elif failure_mode == "metadata_mismatch":
+        payload = _valid_dg_checkpoint_payload()
+        payload["session"] = "wrong"
+        torch.save(payload, checkpoint)
+    expected_sha = runner.framework.file_sha256(checkpoint) if checkpoint.is_file() else "missing"
+    plan = pd.DataFrame([{"task_key": "626:0:1", "session": "626", "seed": 0, "fold": 1, "outer_train_cycles": "1,2,3", "outer_test_cycles": "4", "historical_checkpoint_path": str(checkpoint), "historical_checkpoint_sha256": expected_sha}])
+    args = type("Args", (), {"output_dir": tmp_path / "output"})()
+    with pytest.raises(RuntimeError, match="preflight failed before Phase 1"):
+        runner.historical_checkpoint_preflight(args, plan, expected_count=1)
+    audit = runner.json.loads((args.output_dir / "historical_checkpoint_preflight.json").read_text())
+    assert audit["status"] == "FAIL"
+    assert audit["metadata_match"] < 1
+
+
+def test_missing_required_aggregate_prevents_completion(tmp_path: Path) -> None:
+    for name in runner.REQUIRED_RUN_OUTPUTS:
+        if name != "outer_target_predictions.csv":
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("placeholder")
+    with pytest.raises(FileNotFoundError, match="outer_target_predictions.csv"):
+        runner.aggregate_artifact_sha256(tmp_path)
+
+
+def test_status_rejects_posthoc_frozen_q_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in runner.REQUIRED_RUN_OUTPUTS:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("placeholder")
+    quality = tmp_path / "session_training_only_quality.csv"
+    quality.write_text("session,Q_DG_session\n626,0.5\n")
+    runner.framework.atomic_json(tmp_path / "QUALITY_FROZEN.json", {"status": "frozen_before_target_reference_load", "session_quality_sha256": runner.framework.file_sha256(quality)})
+    hashes = runner.aggregate_artifact_sha256(tmp_path)
+    runner.framework.atomic_json(tmp_path / "RUN_COMPLETE.json", {"status": "complete", "aggregate_artifact_sha256": hashes})
+    runner.validate_completed_run_integrity(tmp_path, runner.json.loads((tmp_path / "RUN_COMPLETE.json").read_text()))
+    quality.write_text("session,Q_DG_session\n626,0.9\n")
+    monkeypatch.setattr(runner, "load_strict_plan", lambda args: (pd.DataFrame(), pd.DataFrame(), {}))
+    args = type("Args", (), {"output_dir": tmp_path})()
+    with pytest.raises(AssertionError, match="frozen-Q integrity failed"):
+        runner.run_status(args)
